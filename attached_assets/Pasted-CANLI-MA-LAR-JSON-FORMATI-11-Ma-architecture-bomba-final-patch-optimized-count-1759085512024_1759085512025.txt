@@ -1,0 +1,90 @@
+CANLI MAÇLAR JSON FORMATI (11 Maç):
+
+{
+  "architecture": "bomba_final_patch_optimized",
+  "count": 11,
+  "status": "success",
+  "matches": [
+    {
+      "id": "sm_19433513",
+      "home_team": "FC Union Berlin",
+      "away_team": "Hamburger SV",
+      "league_id": 82,
+      "league_name": "Germany Bundesliga",
+      "league_country": "Germany", 
+      "league_flag": "🇩🇪",
+      "score_home": 0,
+      "score_away": 0,
+      "minute": 0,
+      "status": "inplay",
+      "xg_home": 0.0,
+      "xg_away": 0.0,
+      "xg_source": "none"
+    },
+    {
+      "id": "sm_19354734", 
+      "home_team": "Molde",
+      "away_team": "Vålerenga",
+      "league_id": 444,
+      "league_name": "Norway Eliteserien", 
+      "league_country": "Norway",
+      "league_flag": "🇳🇴",
+      "score_home": 3,
+      "score_away": 1,
+      "minute": 0,
+      "status": "inplay",
+      "xg_home": 2.7,
+      "xg_away": 0.9,
+      "xg_source": "fallback_xg"
+    },
+    {
+      "id": "sm_19424926",
+      "home_team": "Milan", 
+      "away_team": "Napoli",
+      "league_id": 384,
+      "league_name": "Italy Serie A",
+      "league_country": "Italy",
+      "league_flag": "🇮🇹",
+      "score_home": 0,
+      "score_away": 0,
+      "minute": 0,
+      "status": "inplay"
+    },
+    {
+      "id": "sm_19442989",
+      "home_team": "Fenerbahçe",
+      "away_team": "Antalyaspor", 
+      "league_id": 600,
+      "league_name": "Turkey Super Lig",
+      "league_country": "Turkey",
+      "league_flag": "🇹🇷",
+      "score_home": 1,
+      "score_away": 0,
+      "minute": 0,
+      "status": "inplay"
+    },
+    {
+      "id": "sm_19387151",
+      "home_team": "Bahia",
+      "away_team": "Palmeiras",
+      "league_id": 648, 
+      "league_name": "Brazil Serie A",
+      "league_country": "Brazil",
+      "league_flag": "🇧🇷",
+      "score_home": 0,
+      "score_away": 0,
+      "minute": 0,
+      "status": "inplay"
+    }
+  ]
+}
+📊 ÖZET:
+
+11 canlı maç aktif
+7 farklı lig: Almanya, İtalya, Türkiye, Brezilya, Norveç, Belçika, İspanya La Liga 2
+Öne çıkanlar:
+🔥 Molde vs Vålerenga: 3-1 (yüksek xG)
+🇹🇷 Fenerbahçe vs Antalyaspor: 1-0
+🇮🇹 Milan vs Napoli: 0-0 (Serie A)
+🇧🇷 Bahia vs Palmeiras: 0-0 (Brazil Serie A)
+✅ LEAGUE_NAME FIX CONFIRMED: Tüm maçlarda doğru lig isimleri görünüyor! 🎉

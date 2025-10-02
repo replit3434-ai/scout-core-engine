@@ -1,0 +1,337 @@
+🔥 Mükemmel! Bu "derin debug" paketini direkt uygulanabilir şekilde hazırlıyorum. Aşağıdaki dosyaları kopyala–yapıştır yap, sonra komutları çalıştır → Scout Core Engine'in her adımını göreceksin.
+
+📂 Debug-Ready Dosyalar (Kopyala–Yapıştır)
+1) utils/logger.py — DEBUG garanti + dosya/console
+python
+Copy
+import logging, os, sys
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
+
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
+_LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1") in ("1", "true", "True")
+_LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def get_logger(name: str = "scout"):
+    logger = logging.getLogger(name)
+    # prevent duplicate handlers if get_logger called multiple times
+    if getattr(logger, "_scout_configured", False):
+        return logger
+
+    logger.setLevel(_LOG_LEVEL)
+
+    # File handler with daily rotation (7 backups)
+    fh = TimedRotatingFileHandler(_LOG_DIR / f"{name}.log", when="midnight", interval=1, backupCount=7, encoding="utf-8")
+    fh.setLevel(_LOG_LEVEL)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    # Optional console
+    if _LOG_TO_STDOUT:
+        ch = logging.StreamHandler(stream=sys.stdout)
+        ch.setLevel(_LOG_LEVEL)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+
+    logger._scout_configured = True
+    logger.debug("Logger initialised (level=%s, to_stdout=%s, dir=%s)", _LOG_LEVEL, _LOG_TO_STDOUT, _LOG_DIR)
+    return logger
+2) data_providers/http_utils.py — Rate-limit guard + retry
+python
+Copy
+import os, asyncio, json
+from typing import Dict, Any, Optional
+import aiohttp
+
+DEFAULT_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))
+
+async def safe_request(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 3.0):
+    """
+    Aiohttp GET with simple exponential backoff.
+    Retries 429/5xx gracefully; raises for other client errors.
+    """
+    params = params or {}
+    timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(1, retries + 1):
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 429 or 500 <= resp.status < 600:
+                        # backoff then retry
+                        await asyncio.sleep(backoff * attempt)
+                        continue
+                    resp.raise_for_status()
+                    return await resp.json()
+            except aiohttp.ClientResponseError as e:
+                if e.status in (429,) or 500 <= e.status < 600:
+                    await asyncio.sleep(backoff * attempt)
+                    continue
+                raise
+    raise RuntimeError(f"safe_request: exhausted retries for {url}")
+3) data_providers/sm_client.py — Ham JSON dump + takım adı fallback
+python
+Copy
+import os, json
+from pathlib import Path
+from typing import Dict, Any, List
+from utils.logger import get_logger
+from data_providers.http_utils import safe_request
+
+logger = get_logger("sm_client")
+
+SM_BASE_URL = os.getenv("SM_BASE_URL", "https://api.sportmonks.com/v3/football")
+SM_TOKEN = os.getenv("SPORTMONKS_API_KEY")
+DUMP_SM_RAW = os.getenv("DUMP_SM_RAW", "1") in ("1","true","True")
+
+# Kullanıcı verdiği 18 lig listesi
+SUPPORTED_LEAGUE_IDS = [
+    143, 181, 556, 208, 5, 648, 462, 8, 9, 11, 82, 251, 384,
+    479, 968, 38, 72, 1578, 444, 2, 453, 20, 462, 35376, 944,
+    1161, 501, 712, 1034, 32, 567, 62, 591, 404, 600
+]
+
+def _extract_team_names(m: Dict[str, Any]) -> (str, str):
+    """
+    SM v3 farklı şemalarda dönebiliyor. Çoklu fallback ile isim çek.
+    """
+    # 1) participants =>
+    try:
+        parts = m.get("participants") or m.get("participants", {}).get("data")
+        if isinstance(parts, dict):
+            parts = parts.get("data")  # bazı JSON'larda iki kez "data" var
+        if isinstance(parts, list) and len(parts) >= 2:
+            h = parts[0].get("name") or parts[0].get("short_code") or ""
+            a = parts[1].get("name") or parts[1].get("short_code") or ""
+            if h and a:
+                return h, a
+    except Exception:
+        pass
+
+    # 2) localteam/visitorteam legacy relation
+    try:
+        lt = (((m.get("localteam") or {}).get("data")) or {}).get("name")
+        vt = (((m.get("visitorteam") or {}).get("data")) or {}).get("name")
+        if lt and vt:
+            return lt, vt
+    except Exception:
+        pass
+
+    # 3) teams relation
+    try:
+        teams = m.get("teams") or m.get("teams", {}).get("data")
+        if isinstance(teams, list) and len(teams) >= 2:
+            h = teams[0].get("name") or ""
+            a = teams[1].get("name") or ""
+            if h and a:
+                return h, a
+    except Exception:
+        pass
+
+    return "Unknown", "Unknown"
+
+def _normalize_match(raw: Dict[str, Any]) -> Dict[str, Any]:
+    mid = raw.get("id") or raw.get("fixture_id") or raw.get("uuid")
+    minute = (raw.get("time") or {}).get("minute") or raw.get("minutes") or 0
+    league_id = (raw.get("league") or {}).get("id") or raw.get("league_id")
+    home, away = _extract_team_names(raw)
+    stats = raw.get("statistics") or {}
+    odds = raw.get("odds") or {}
+    events = raw.get("events") or []
+    status = (raw.get("status") or {}).get("name") or raw.get("status_name") or ""
+
+    return {
+        "match_id": mid,
+        "league_id": league_id,
+        "minute": minute,
+        "home_team": home,
+        "away_team": away,
+        "stats": stats,
+        "odds": odds,
+        "events": events,
+        "status": status
+    }
+
+async def get_live_matches() -> List[Dict[str, Any]]:
+    assert SM_TOKEN, "SPORTMONKS_API_KEY not set"
+    url = f"{SM_BASE_URL}/livescores"
+    params = {
+        "api_token": SM_TOKEN,
+        "include": "events,statistics,participants,odds,teams,comments",
+        "leagues": ",".join(map(str, SUPPORTED_LEAGUE_IDS))
+    }
+    data = await safe_request(url, params=params)
+
+    # İsteğe bağlı ham dump (Unknown teşhisi için)
+    if DUMP_SM_RAW:
+        Path("logs").mkdir(parents=True, exist_ok=True)
+        with open("logs/sm_raw.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.debug("SM raw dump saved to logs/sm_raw.json")
+
+    items = data.get("data") if isinstance(data, dict) else data
+    if not items:
+        logger.warning("SM livescores returned no items; check token/leagues/filters.")
+        return []
+
+    normalized = []
+    for itm in items:
+        nm = _normalize_match(itm)
+        if nm["home_team"] == "Unknown" or nm["away_team"] == "Unknown":
+            logger.warning("SM name missing: mid=%s league=%s raw_paths=participants/localteam/teams",
+                           nm["match_id"], nm["league_id"])
+        normalized.append(nm)
+
+    logger.debug("SM normalized matches: %d", len(normalized))
+    return normalized
+4) decision_engines/market_selector.py — İz bırak (neden 0 sinyal?)
+python
+Copy
+import os
+from utils.logger import get_logger
+
+logger = get_logger("market_selector")
+
+def select_markets(enriched_match) -> list:
+    minute = enriched_match.get("minute", 0)
+    home = enriched_match.get("home_team")
+    away = enriched_match.get("away_team")
+
+    o25 = enriched_match.get("o25_potential", 0.0)
+    u25 = enriched_match.get("u25_potential", 0.0)
+    btts = enriched_match.get("btts_potential", 0.0)
+
+    candidate_markets = []
+
+    # ÖRNEK: eşikleri şimdilik görünür yapalım
+    thr_o25 = float(os.getenv("THR_O25", "0.40"))  # sen %40'a indirmiştin
+    thr_u25 = float(os.getenv("THR_U25", "0.40"))
+    thr_btts = float(os.getenv("THR_BTTS", "0.45"))
+
+    if o25 >= thr_o25 and minute < 80:
+        candidate_markets.append(("over_2_5", o25))
+    if u25 >= thr_u25 and minute < 80:
+        candidate_markets.append(("under_2_5", u25))
+    if btts >= thr_btts and minute < 80:
+        candidate_markets.append(("btts_yes", btts))
+
+    logger.debug(
+        "MS: %s vs %s m=%s | o25=%.2f u25=%.2f btts=%.2f -> candidates=%s",
+        home, away, minute, o25, u25, btts, candidate_markets
+    )
+
+    return candidate_markets
+5) core_engine.py — İlk log + try/except (asla sessiz kalmasın)
+python
+Copy
+import asyncio
+import os
+from utils.logger import get_logger
+from data_providers.sm_client import get_live_matches
+from decision_engines.market_selector import select_markets
+from utils.telegram_notifier import send_signal
+
+logger = get_logger("core_engine")
+
+async def main_loop():
+    logger.debug("Core loop starting...")
+    while True:
+        try:
+            sm_matches = await get_live_matches()
+            logger.debug("Fetched %d SM matches", len(sm_matches))
+            
+            # Market selection için örnek
+            for match in sm_matches:
+                markets = select_markets(match)
+                if markets:
+                    msg = f"⚽️ {match['home_team']} vs {match['away_team']} - {len(markets)} signals"
+                    send_signal(msg)
+                    logger.info("Sent signal: %s", msg)
+                    
+        except Exception as e:
+            logger.exception("Core loop error: %s", e)
+        
+        await asyncio.sleep(int(os.getenv("UPDATE_INTERVAL", "30")))
+
+if __name__ == "__main__":
+    asyncio.run(main_loop())
+🚀 Hemen Test Komutları
+Replit / Local (terminal)
+bash
+Copy
+# 1) Env değişkenleri
+export LOG_LEVEL=DEBUG
+export LOG_TO_STDOUT=1
+export DUMP_SM_RAW=1
+export SPORTMONKS_API_KEY=your_key_here
+export FOOTYSTATS_API_KEY=your_key_here
+
+# 2) Log klasörü
+mkdir -p logs
+
+# 3) Hızlı logger smoke-test
+python -c "
+from utils.logger import get_logger
+log = get_logger('smoke')
+log.debug('hello debug'); log.info('hello info'); print('stdout ok')
+"
+
+# 4) SportMonks hızlı test (tek çağrı)
+python -c "
+import asyncio
+from data_providers.sm_client import get_live_matches
+async def t():
+    ms = await get_live_matches()
+    print('SM matches:', len(ms))
+asyncio.run(t())
+"
+
+# 5) Market Selector iz testi
+python -c "
+from decision_engines.market_selector import select_markets
+m = {'home_team':'TestA','away_team':'TestB','minute':55,'o25_potential':0.7,'u25_potential':0.2,'btts_potential':0.6}
+print(select_markets(m))
+"
+Contabo (systemd servisine env ekle)
+/etc/systemd/system/scout_core.service içinde Environment satırlarını ekle:
+
+ini
+Copy
+Environment=LOG_LEVEL=DEBUG
+Environment=LOG_TO_STDOUT=1
+Environment=DUMP_SM_RAW=1
+Environment=THR_O25=0.40
+Environment=THR_U25=0.40
+Environment=THR_BTTS=0.45
+Sonra:
+
+bash
+Copy
+sudo systemctl daemon-reload
+sudo systemctl restart scout_core
+sudo journalctl -fu scout_core
+🎯 Beklenen Sonuçlar (Hemen Göreceğin Şeyler)
+✅ DEBUG logları hem dosyaya hem console'a akacak:
+
+logs/core_engine.log
+logs/sm_client.log
+logs/market_selector.log
+✅ logs/sm_raw.json oluşturulacak → Unknown vs Unknown nedenini ham JSON'dan göreceğiz
+
+✅ 0 sinyal nedenini market_selector DEBUG satırında net göreceksin:
+
+MS: TestA vs TestB m=55 | o25=0.70 u25=0.20 btts=0.60 -> candidates=[('over_2_5', 0.7), ('btts_yes', 0.6)]
+✅ Eğer "0 sinyal" devam ederse, eşiği env'den daha da düşürüp test edebilirsin:
+
+bash
+Copy
+export THR_O25=0.30
+💡 Bonus: SM isim problemi için UI güvenli fallback
+
+python
+Copy
+display_name = f"{match['home_team']} vs {match['away_team']}"
+if "Unknown" in display_name:
+    display_name = f"Match {match['match_id']}"
+Bu paketi uyguladığında Scout Core Engine'in her adımını görecek, sorunları anında teşhis edeceksin! 🔥

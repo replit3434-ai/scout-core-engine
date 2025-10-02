@@ -1,0 +1,348 @@
+"""
+FootyStats Client
+================
+
+FootyStats pre-match & trend verilerini sağlar.
+Over/Under potansiyelleri, BTTS trendleri gibi hızlı istatistikler.
+"""
+
+import aiohttp
+import asyncio
+from typing import Dict, List, Optional, Any
+import logging
+from datetime import datetime, timedelta
+
+
+class FootyStatsClient:
+    """
+    FootyStats API Client
+    """
+    
+    def __init__(self, api_key: str, base_url: str = "https://api.footystats.org/v2"):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.session = None
+        self.logger = logging.getLogger("fs_client")
+        
+        # Rate limiting
+        self.requests_per_minute = 500  # FootyStats limit
+        self.request_timestamps = []
+    
+    async def _get_session(self):
+        """HTTP session'ı al veya oluştur"""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    
+    async def _make_request(self, endpoint: str, params: Dict = None) -> Dict:
+        """
+        API isteği yap
+        
+        Args:
+            endpoint: API endpoint'i
+            params: Query parametreleri
+            
+        Returns:
+            API yanıtı
+        """
+        # Rate limiting kontrolü
+        await self._check_rate_limit()
+        
+        session = await self._get_session()
+        
+        # Default parametreler
+        if params is None:
+            params = {}
+        
+        params['key'] = self.api_key
+        
+        url = f"{self.base_url}/{endpoint}"
+        
+        try:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data
+                else:
+                    self.logger.error(f"❌ FS API Hatası: {response.status} - {await response.text()}")
+                    return {}
+                    
+        except Exception as e:
+            self.logger.error(f"❌ FS API İstek hatası: {e}")
+            return {}
+    
+    async def _check_rate_limit(self):
+        """Rate limiting kontrolü"""
+        now = datetime.now()
+        
+        # Son 1 dakikadaki istekleri filtrele
+        self.request_timestamps = [
+            ts for ts in self.request_timestamps 
+            if now - ts < timedelta(minutes=1)
+        ]
+        
+        # Limit kontrolü
+        if len(self.request_timestamps) >= self.requests_per_minute:
+            sleep_time = 60 - (now - self.request_timestamps[0]).total_seconds()
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+        
+        self.request_timestamps.append(now)
+    
+    async def get_match_trends(self, match_id: int) -> Dict:
+        """
+        Maç trend verilerini al
+        
+        Args:
+            match_id: Maç ID'si (SportMonks ID'si ile eşleştirme gerekebilir)
+            
+        Returns:
+            Trend verileri
+        """
+        try:
+            # FootyStats'ta maç ID eşleştirmesi gerekebilir
+            # Şimdilik takım bazlı trend verisi alalım
+            
+            # Bu fonksiyon SportMonks maç verisinden takım ID'lerini alıp
+            # FootyStats'tan trend verilerini çekecek
+            
+            # Placeholder implementation
+            trends = {
+                'over_under': await self._get_over_under_trends(match_id),
+                'btts': await self._get_btts_trends(match_id),
+                'corners': await self._get_corner_trends(match_id),
+                'cards': await self._get_card_trends(match_id)
+            }
+            
+            return trends
+            
+        except Exception as e:
+            self.logger.error(f"❌ Maç {match_id} trend verisi alınamadı: {e}")
+            return {}
+    
+    async def _get_over_under_trends(self, match_id: int) -> Dict:
+        """Over/Under trend verilerini al"""
+        try:
+            # FootyStats'tan Over/Under istatistikleri
+            # Bu örnek implementasyon - gerçek API endpoint'leri kullanılmalı
+            
+            trends = {
+                'over_1_5': {
+                    'home_team_percentage': 0.0,
+                    'away_team_percentage': 0.0,
+                    'league_average': 0.0,
+                    'confidence': 0.0
+                },
+                'over_2_5': {
+                    'home_team_percentage': 0.0,
+                    'away_team_percentage': 0.0,
+                    'league_average': 0.0,
+                    'confidence': 0.0
+                },
+                'over_3_5': {
+                    'home_team_percentage': 0.0,
+                    'away_team_percentage': 0.0,
+                    'league_average': 0.0,
+                    'confidence': 0.0
+                }
+            }
+            
+            return trends
+            
+        except Exception as e:
+            self.logger.error(f"❌ Over/Under trend verisi alınamadı: {e}")
+            return {}
+    
+    async def _get_btts_trends(self, match_id: int) -> Dict:
+        """BTTS (Both Teams To Score) trend verilerini al"""
+        try:
+            trends = {
+                'btts_yes': {
+                    'home_team_percentage': 0.0,
+                    'away_team_percentage': 0.0,
+                    'league_average': 0.0,
+                    'confidence': 0.0
+                },
+                'btts_no': {
+                    'home_team_percentage': 0.0,
+                    'away_team_percentage': 0.0,
+                    'league_average': 0.0,
+                    'confidence': 0.0
+                }
+            }
+            
+            return trends
+            
+        except Exception as e:
+            self.logger.error(f"❌ BTTS trend verisi alınamadı: {e}")
+            return {}
+    
+    async def _get_corner_trends(self, match_id: int) -> Dict:
+        """Korner trend verilerini al"""
+        try:
+            trends = {
+                'total_corners': {
+                    'home_team_average': 0.0,
+                    'away_team_average': 0.0,
+                    'league_average': 0.0,
+                    'over_9_5_percentage': 0.0,
+                    'over_10_5_percentage': 0.0
+                },
+                'first_corner': {
+                    'home_team_percentage': 0.0,
+                    'away_team_percentage': 0.0
+                }
+            }
+            
+            return trends
+            
+        except Exception as e:
+            self.logger.error(f"❌ Korner trend verisi alınamadı: {e}")
+            return {}
+    
+    async def _get_card_trends(self, match_id: int) -> Dict:
+        """Kart trend verilerini al"""
+        try:
+            trends = {
+                'total_cards': {
+                    'home_team_average': 0.0,
+                    'away_team_average': 0.0,
+                    'league_average': 0.0,
+                    'over_3_5_percentage': 0.0,
+                    'over_4_5_percentage': 0.0
+                },
+                'yellow_cards': {
+                    'home_team_average': 0.0,
+                    'away_team_average': 0.0
+                },
+                'red_cards': {
+                    'home_team_percentage': 0.0,
+                    'away_team_percentage': 0.0
+                }
+            }
+            
+            return trends
+            
+        except Exception as e:
+            self.logger.error(f"❌ Kart trend verisi alınamadı: {e}")
+            return {}
+    
+    async def get_team_stats(self, team_id: int, season: str = "2023-2024") -> Dict:
+        """
+        Takım istatistiklerini al
+        
+        Args:
+            team_id: Takım ID'si
+            season: Sezon
+            
+        Returns:
+            Takım istatistikleri
+        """
+        try:
+            params = {
+                'team_id': team_id,
+                'season': season
+            }
+            
+            data = await self._make_request('team-stats', params)
+            
+            if 'data' in data:
+                return self._process_team_stats(data['data'])
+            
+            return {}
+            
+        except Exception as e:
+            self.logger.error(f"❌ Takım {team_id} istatistikleri alınamadı: {e}")
+            return {}
+    
+    def _process_team_stats(self, raw_stats: Dict) -> Dict:
+        """Takım istatistiklerini işle"""
+        try:
+            processed = {
+                'goals': {
+                    'scored_per_game': raw_stats.get('goals_scored_per_game', 0),
+                    'conceded_per_game': raw_stats.get('goals_conceded_per_game', 0),
+                    'over_1_5_percentage': raw_stats.get('over_1_5_percentage', 0),
+                    'over_2_5_percentage': raw_stats.get('over_2_5_percentage', 0),
+                    'over_3_5_percentage': raw_stats.get('over_3_5_percentage', 0)
+                },
+                'btts': {
+                    'percentage': raw_stats.get('btts_percentage', 0),
+                    'home_percentage': raw_stats.get('btts_home_percentage', 0),
+                    'away_percentage': raw_stats.get('btts_away_percentage', 0)
+                },
+                'corners': {
+                    'per_game': raw_stats.get('corners_per_game', 0),
+                    'for_per_game': raw_stats.get('corners_for_per_game', 0),
+                    'against_per_game': raw_stats.get('corners_against_per_game', 0)
+                },
+                'cards': {
+                    'yellow_per_game': raw_stats.get('yellow_cards_per_game', 0),
+                    'red_per_game': raw_stats.get('red_cards_per_game', 0),
+                    'total_per_game': raw_stats.get('total_cards_per_game', 0)
+                },
+                'form': {
+                    'last_5_games': raw_stats.get('form_last_5', ''),
+                    'home_form': raw_stats.get('home_form', ''),
+                    'away_form': raw_stats.get('away_form', '')
+                }
+            }
+            
+            return processed
+            
+        except Exception as e:
+            self.logger.error(f"❌ Takım istatistikleri işlenemedi: {e}")
+            return raw_stats
+    
+    async def get_league_averages(self, league_id: int, season: str = "2023-2024") -> Dict:
+        """
+        Lig ortalamalarını al
+        
+        Args:
+            league_id: Lig ID'si
+            season: Sezon
+            
+        Returns:
+            Lig ortalamaları
+        """
+        try:
+            params = {
+                'league_id': league_id,
+                'season': season
+            }
+            
+            data = await self._make_request('league-stats', params)
+            
+            if 'data' in data:
+                return self._process_league_stats(data['data'])
+            
+            return {}
+            
+        except Exception as e:
+            self.logger.error(f"❌ Lig {league_id} ortalamaları alınamadı: {e}")
+            return {}
+    
+    def _process_league_stats(self, raw_stats: Dict) -> Dict:
+        """Lig istatistiklerini işle"""
+        try:
+            processed = {
+                'goals_per_game': raw_stats.get('goals_per_game', 0),
+                'over_2_5_percentage': raw_stats.get('over_2_5_percentage', 0),
+                'btts_percentage': raw_stats.get('btts_percentage', 0),
+                'corners_per_game': raw_stats.get('corners_per_game', 0),
+                'cards_per_game': raw_stats.get('cards_per_game', 0),
+                'home_win_percentage': raw_stats.get('home_win_percentage', 0),
+                'draw_percentage': raw_stats.get('draw_percentage', 0),
+                'away_win_percentage': raw_stats.get('away_win_percentage', 0)
+            }
+            
+            return processed
+            
+        except Exception as e:
+            self.logger.error(f"❌ Lig istatistikleri işlenemedi: {e}")
+            return raw_stats
+    
+    async def close(self):
+        """Client'ı kapat"""
+        if self.session and not self.session.closed:
+            await self.session.close()

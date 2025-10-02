@@ -1,0 +1,410 @@
+"""
+Logging Utilities
+================
+
+Scout Core Engine v6.0 için logging yapılandırması
+"""
+
+import logging
+import logging.handlers
+import sys
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+
+
+def setup_logger(
+    name: str,
+    level: str = "INFO",
+    log_file: Optional[str] = None,
+    max_size: int = 10 * 1024 * 1024,  # 10MB
+    backup_count: int = 5,
+    console_output: bool = True
+) -> logging.Logger:
+    """
+    Logger'ı yapılandır
+    
+    Args:
+        name: Logger adı
+        level: Log seviyesi (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file: Log dosyası yolu
+        max_size: Maksimum dosya boyutu (bytes)
+        backup_count: Backup dosya sayısı
+        console_output: Console'a da yazdır mı?
+        
+    Returns:
+        Yapılandırılmış logger
+    """
+    
+    # Logger oluştur
+    logger = logging.getLogger(name)
+    
+    # Seviye ayarla
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+    logger.setLevel(numeric_level)
+    
+    # Eğer handler'lar zaten varsa temizle
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    # Formatter oluştur
+    formatter = ScoutFormatter()
+    
+    # Console handler
+    if console_output:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(numeric_level)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+    
+    # File handler
+    if log_file:
+        try:
+            # Log dizinini oluştur
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Rotating file handler
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=max_size,
+                backupCount=backup_count,
+                encoding='utf-8'
+            )
+            file_handler.setLevel(numeric_level)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            
+        except Exception as e:
+            print(f"❌ Log dosyası oluşturulamadı: {e}")
+    
+    # Propagation'ı kapat (duplicate log'ları önlemek için)
+    logger.propagate = False
+    
+    return logger
+
+
+class ScoutFormatter(logging.Formatter):
+    """
+    Scout için özel log formatter'ı
+    """
+    
+    def __init__(self):
+        super().__init__()
+        
+        # Renkli çıktı için ANSI kodları
+        self.colors = {
+            'DEBUG': '\033[36m',    # Cyan
+            'INFO': '\033[32m',     # Green
+            'WARNING': '\033[33m',  # Yellow
+            'ERROR': '\033[31m',    # Red
+            'CRITICAL': '\033[35m', # Magenta
+            'RESET': '\033[0m'      # Reset
+        }
+        
+        # Format şablonları
+        self.console_format = (
+            "{color}[{levelname:8}]{reset} "
+            "{asctime} | {name:15} | {message}"
+        )
+        
+        self.file_format = (
+            "[{levelname:8}] {asctime} | {name:15} | "
+            "{funcName}:{lineno} | {message}"
+        )
+    
+    def format(self, record):
+        """
+        Log kaydını formatla
+        
+        Args:
+            record: Log record
+            
+        Returns:
+            Formatlanmış log mesajı
+        """
+        try:
+            # Timestamp formatla
+            record.asctime = datetime.fromtimestamp(record.created).strftime(
+                '%Y-%m-%d %H:%M:%S'
+            )
+            
+            # Handler tipine göre format seç
+            if hasattr(record, 'handler_type') and record.handler_type == 'file':
+                # Dosya için format (renksiz)
+                formatted = self.file_format.format(
+                    levelname=record.levelname,
+                    asctime=record.asctime,
+                    name=record.name,
+                    funcName=record.funcName,
+                    lineno=record.lineno,
+                    message=record.getMessage()
+                )
+            else:
+                # Console için format (renkli)
+                color = self.colors.get(record.levelname, '')
+                reset = self.colors['RESET']
+                
+                formatted = self.console_format.format(
+                    color=color,
+                    reset=reset,
+                    levelname=record.levelname,
+                    asctime=record.asctime,
+                    name=record.name,
+                    message=record.getMessage()
+                )
+            
+            # Exception bilgisi varsa ekle
+            if record.exc_info:
+                formatted += '\n' + self.formatException(record.exc_info)
+            
+            return formatted
+            
+        except Exception as e:
+            # Formatter hatası durumunda basit format kullan
+            return f"[FORMATTER ERROR] {record.getMessage()} | Error: {e}"
+
+
+class PerformanceLogger:
+    """
+    Performance metrikleri için özel logger
+    """
+    
+    def __init__(self, name: str = "performance"):
+        self.logger = logging.getLogger(f"scout.{name}")
+        self.start_times = {}
+    
+    def start_timer(self, operation: str):
+        """
+        İşlem zamanlayıcısını başlat
+        
+        Args:
+            operation: İşlem adı
+        """
+        self.start_times[operation] = datetime.now()
+    
+    def end_timer(self, operation: str, extra_info: str = ""):
+        """
+        İşlem zamanlayıcısını bitir ve logla
+        
+        Args:
+            operation: İşlem adı
+            extra_info: Ek bilgi
+        """
+        if operation in self.start_times:
+            duration = (datetime.now() - self.start_times[operation]).total_seconds()
+            
+            info_text = f" | {extra_info}" if extra_info else ""
+            self.logger.info(f"⏱️  {operation}: {duration:.3f}s{info_text}")
+            
+            del self.start_times[operation]
+        else:
+            self.logger.warning(f"⚠️  Timer bulunamadı: {operation}")
+    
+    def log_metric(self, metric_name: str, value: float, unit: str = ""):
+        """
+        Metrik logla
+        
+        Args:
+            metric_name: Metrik adı
+            value: Değer
+            unit: Birim
+        """
+        unit_text = f" {unit}" if unit else ""
+        self.logger.info(f"📊 {metric_name}: {value:.2f}{unit_text}")
+
+
+class ErrorLogger:
+    """
+    Hata takibi için özel logger
+    """
+    
+    def __init__(self, name: str = "errors"):
+        self.logger = logging.getLogger(f"scout.{name}")
+        self.error_counts = {}
+    
+    def log_error(self, error_type: str, error_message: str, context: dict = None):
+        """
+        Hata logla ve sayaç güncelle
+        
+        Args:
+            error_type: Hata tipi
+            error_message: Hata mesajı
+            context: Ek bağlam bilgisi
+        """
+        # Hata sayacını güncelle
+        self.error_counts[error_type] = self.error_counts.get(error_type, 0) + 1
+        
+        # Context bilgisini formatla
+        context_text = ""
+        if context:
+            context_items = [f"{k}={v}" for k, v in context.items()]
+            context_text = f" | Context: {', '.join(context_items)}"
+        
+        # Log mesajı
+        self.logger.error(
+            f"❌ {error_type}: {error_message} "
+            f"(Count: {self.error_counts[error_type]}){context_text}"
+        )
+    
+    def get_error_summary(self) -> dict:
+        """
+        Hata özetini al
+        
+        Returns:
+            Hata sayaçları
+        """
+        return self.error_counts.copy()
+
+
+class APILogger:
+    """
+    API istekleri için özel logger
+    """
+    
+    def __init__(self, name: str = "api"):
+        self.logger = logging.getLogger(f"scout.{name}")
+        self.request_counts = {}
+        self.response_times = []
+    
+    def log_request(self, provider: str, endpoint: str, status_code: int, 
+                   response_time: float, data_size: int = 0):
+        """
+        API isteğini logla
+        
+        Args:
+            provider: API sağlayıcısı (SM, FS)
+            endpoint: Endpoint
+            status_code: HTTP status kodu
+            response_time: Yanıt süresi (saniye)
+            data_size: Veri boyutu (bytes)
+        """
+        # Request sayacını güncelle
+        key = f"{provider}_{endpoint}"
+        self.request_counts[key] = self.request_counts.get(key, 0) + 1
+        
+        # Response time'ı kaydet
+        self.response_times.append(response_time)
+        
+        # Son 100 response time'ı tut
+        if len(self.response_times) > 100:
+            self.response_times = self.response_times[-100:]
+        
+        # Status'a göre log seviyesi
+        if status_code == 200:
+            level = "info"
+            icon = "✅"
+        elif status_code < 400:
+            level = "info"
+            icon = "ℹ️"
+        elif status_code < 500:
+            level = "warning"
+            icon = "⚠️"
+        else:
+            level = "error"
+            icon = "❌"
+        
+        # Size formatla
+        size_text = f" | {data_size} bytes" if data_size > 0 else ""
+        
+        # Log mesajı
+        log_message = (
+            f"{icon} {provider} | {endpoint} | "
+            f"{status_code} | {response_time:.3f}s{size_text} | "
+            f"Count: {self.request_counts[key]}"
+        )
+        
+        getattr(self.logger, level)(log_message)
+    
+    def get_api_stats(self) -> dict:
+        """
+        API istatistiklerini al
+        
+        Returns:
+            API istatistikleri
+        """
+        avg_response_time = (
+            sum(self.response_times) / len(self.response_times)
+            if self.response_times else 0
+        )
+        
+        return {
+            'request_counts': self.request_counts.copy(),
+            'total_requests': sum(self.request_counts.values()),
+            'avg_response_time': avg_response_time,
+            'recent_response_times': self.response_times[-10:]  # Son 10
+        }
+
+
+# Global logger instance'ları
+performance_logger = PerformanceLogger()
+error_logger = ErrorLogger()
+api_logger = APILogger()
+
+
+def get_logger(name: str) -> logging.Logger:
+    """
+    Logger al (kısayol fonksiyon)
+    
+    Args:
+        name: Logger adı
+        
+    Returns:
+        Logger instance
+    """
+    return logging.getLogger(f"scout.{name}")
+
+
+def log_system_info():
+    """
+    Sistem bilgilerini logla
+    """
+    import platform
+    import psutil
+    
+    logger = get_logger("system")
+    
+    logger.info("🖥️  Sistem Bilgileri:")
+    logger.info(f"   Platform: {platform.platform()}")
+    logger.info(f"   Python: {platform.python_version()}")
+    logger.info(f"   CPU: {psutil.cpu_count()} cores")
+    logger.info(f"   RAM: {psutil.virtual_memory().total // (1024**3)} GB")
+    logger.info(f"   Disk: {psutil.disk_usage('/').total // (1024**3)} GB")
+
+
+def setup_all_loggers(config) -> dict:
+    """
+    Tüm logger'ları yapılandır
+    
+    Args:
+        config: Config instance
+        
+    Returns:
+        Logger dictionary
+    """
+    loggers = {}
+    
+    # Ana logger
+    loggers['main'] = setup_logger(
+        "scout_core",
+        level=config.log_level,
+        log_file=config.log_file,
+        max_size=config.log_max_size,
+        backup_count=config.log_backup_count
+    )
+    
+    # Bileşen logger'ları
+    components = ['sm_client', 'fs_client', 'market_selector', 'rl_agent']
+    
+    for component in components:
+        loggers[component] = setup_logger(
+            f"scout.{component}",
+            level=config.log_level,
+            log_file=f"logs/{component}.log",
+            console_output=False  # Sadece ana logger console'a yazsın
+        )
+    
+    # Sistem bilgilerini logla
+    log_system_info()
+    
+    return loggers

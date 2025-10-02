@@ -1,0 +1,204 @@
+Kesin teşhis: Livescores odds’u default döndürmüyor; include=odds da çoğu planda/endpoint’te çalışmıyor. Çözüm: odds’u doğru endpoint’ten çekip core pipeline’a enjekte etmek.
+
+Aşağıdaki yama, gerçek canlı oranları devreye alır ve default 2.0 varsayımını tamamen kaldırır.
+
+Plan
+
+Yeni Odds Fetcher: /odds/live ve fixture/{id}?include=odds fallback
+Core merge: match_id → odds_payload bağla
+Market Selector: min odds + value bet aktif
+RL Agent: implied vs model_prob kullanımı
+Cache ve rate-limit: TTL ile tekrar kullanım
+Odds Fetcher (Python) – services/odds_client.py
+python
+Copy
+# services/odds_client.py
+import os, asyncio, time
+from typing import Dict, Any, List, Optional, Tuple
+from utils.logger import get_logger
+from data_providers.http_utils import safe_request
+
+log = get_logger("odds_client")
+
+SM_BASE_URL = os.getenv("SM_BASE_URL", "https://api.sportmonks.com/v3/football")
+SM_TOKEN = os.getenv("SPORTMONKS_API_KEY")
+ODDS_LIVE_ENABLED = os.getenv("ODDS_LIVE_ENABLED", "1") in ("1", "true", "True")
+ODDS_FALLBACK_FIXTURE = os.getenv("ODDS_FALLBACK_FIXTURE", "1") in ("1", "true", "True")
+ODDS_CACHE_TTL = int(os.getenv("ODDS_CACHE_TTL", "45"))  # saniye
+ODDS_FIXTURE_CONCURRENCY = int(os.getenv("ODDS_FIXTURE_CONCURRENCY", "6"))
+
+# Basit cache: fixture_id -> (ts, odds_payload)
+_odds_cache: Dict[str, Tuple[float, Any]] = {}
+
+def _cache_get(fid: str) -> Optional[Any]:
+    hit = _odds_cache.get(fid)
+    if not hit:
+        return None
+    ts, payload = hit
+    if time.time() - ts <= ODDS_CACHE_TTL:
+        return payload
+    return None
+
+def _cache_put(fid: str, payload: Any):
+    _odds_cache[fid] = (time.time(), payload)
+
+async def fetch_odds_live() -> List[Dict[str, Any]]:
+    """
+    /odds/live döner: genelde fixture_id ile eşleştirilebilir yapı.
+    """
+    if not ODDS_LIVE_ENABLED:
+        return []
+    url = f"{SM_BASE_URL}/odds/live"
+    params = {"api_token": SM_TOKEN}
+    try:
+        res = await safe_request(url, params=params)
+        data = res.get("data") if isinstance(res, dict) else res
+        return data or []
+    except Exception as e:
+        log.warning("odds/live fetch failed: %s", e)
+        return []
+
+async def fetch_fixture_odds(fid: str) -> Optional[Any]:
+    """
+    Tek maç odds: fixtures/{id}?include=odds
+    """
+    if not ODDS_FALLBACK_FIXTURE:
+        return None
+    cached = _cache_get(fid)
+    if cached is not None:
+        return cached
+    url = f"{SM_BASE_URL}/fixtures/{fid}"
+    params = {"api_token": SM_TOKEN, "include": "odds"}
+    try:
+        res = await safe_request(url, params=params)
+        data = res.get("data") if isinstance(res, dict) else res
+        odds_payload = data.get("odds") if isinstance(data, dict) else None
+        if odds_payload:
+            _cache_put(fid, odds_payload)
+        return odds_payload
+    except Exception as e:
+        log.debug("fixture odds fetch failed for %s: %s", fid, e)
+        return None
+
+def index_odds_live(odds_live_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    odds/live çıktısını fixture_id ile indexler.
+    Yapıya göre uyarlama: çoğu şemada 'fixture_id' veya 'fixture' içinde id olur.
+    """
+    idx: Dict[str, Any] = {}
+    for o in odds_live_list:
+        fid = o.get("fixture_id") or o.get("fixture") or o.get("id")
+        if not fid:
+            continue
+        idx[str(fid)] = o
+    return idx
+
+async def hydrate_odds_for_matches(matches: List[Dict[str, Any]]) -> None:
+    """
+    Her match için odds_payload doldurur:
+    - Önce odds/live index’inden
+    - Yoksa fixture fallback çağrısı (eşzamanlı sınırlı)
+    """
+    # 1) odds/live toplu
+    live_map: Dict[str, Any] = {}
+    if ODDS_LIVE_ENABLED:
+        live_list = await fetch_odds_live()
+        live_map = index_odds_live(live_list)
+
+    # 2) Maçlara bağla veya eksikler için fixture fallback
+    sem = asyncio.Semaphore(ODDS_FIXTURE_CONCURRENCY)
+    tasks = []
+    async def fetch_one(m: Dict[str, Any]):
+        async with sem:
+            fid = m.get("id") or m.get("fixture_id") or m.get("match_id")
+            if not fid:
+                return
+            if m.get("odds"):  # zaten varsa geç
+                return
+            # live map'te varsa direkt koy
+            lm = live_map.get(str(fid))
+            if lm and lm.get("odds"):
+                m["odds"] = lm["odds"]
+                return
+            # değilse fixture fallback
+            payload = await fetch_fixture_odds(str(fid))
+            if payload:
+                m["odds"] = payload
+
+    for m in matches:
+        # odds yoksa görev oluştur
+        if not isinstance(m.get("odds"), (dict, list)):
+            tasks.append(fetch_one(m))
+
+    if tasks:
+        await asyncio.gather(*tasks)
+sm_client.py içinde merge
+Livescores veya inplay sonrası normalize etmeden önce odds’u hydrate et.
+python
+Copy
+# sm_client.py (livescores sonrası)
+from services.odds_client import hydrate_odds_for_matches
+
+# items: livescores 'data' listesi (ham)
+# ... minute fallback ve 0 filtreleri uygulamadan önce veya sonra:
+await hydrate_odds_for_matches(items)
+
+# normalization sırasında odds_payload’ı not et
+def _normalize_match_sm(raw):
+    # ...
+    return {
+        # diğer alanlar...
+        "odds_payload": raw.get("odds")  # odds.data beklenir; yoksa None
+    }
+Best odds seçimi ve min/value kuralları
+Daha önce paylaştığım odds_utils ve market_selector yamalarını kullanın. Özet kullanım:
+python
+Copy
+from services.odds_utils import select_best_odds, implied_prob_from_odds
+from market_selector import enrich_with_best_odds, apply_min_odds_filter
+
+# signal üretimi sırasında:
+sig = enrich_with_best_odds(sig, match["odds_payload"], cfg)
+if not apply_min_odds_filter(sig, cfg):
+    continue
+if sig.odds:
+    implied = implied_prob_from_odds(sig.odds)
+    margin = float(cfg.get("odds", {}).get("value_margin", 0.10))
+    if sig.confidence > implied * (1 + margin):
+        sig.meta["value_bet"] = True
+        sig.meta["value_score"] = round(sig.confidence - implied, 4)
+Default 2.0’ı tamamen kaldır
+Sinyal oluştururken odds alanını None bırakın; min-odds filtresi odds yoksa eleyecek.
+Böylece “odds yoksa sinyal yok” prensibi işler; ileride istersen “odds zorunlu değil” modunu konfig ile açabilirsin.
+Konfig (config.json) ekleri
+json
+Copy
+{
+  "odds": {
+    "min_odds_default": 1.80,
+    "min_odds_per_market": {
+      "over_2_5": 1.80,
+      "btts_yes": 1.70,
+      "next_goal": 2.10
+    },
+    "bookmaker_whitelist": ["Pinnacle", "Bet365", "Marathon"],
+    "value_margin": 0.10
+  }
+}
+Doğrulama komutları
+odds/live:
+curl "https://api.sportmonks.com/v3/football/odds/live?api_token=$SPORTMONKS_API_KEY" | jq '.data[0] | {fixture_id, has_odds: (.odds!=null)}'
+fixture bazlı:
+curl "https://api.sportmonks.com/v3/football/fixtures/<FIXTURE_ID>?api_token=$SPORTMONKS_API_KEY&include=odds" | jq '.data | {id, odds_count: (.odds.data|length)}'
+Log’lar
+“Odds too low … dropping” → min-odds filtresi çalışıyor
+“value_bet=True” → value bet tespit edildi
+“fixture odds fetch failed …” → rate limit/404 gibi durumlar için bilgi
+“odds/live fetch failed …” → toplu endpoint hatası
+Sonuç
+
+Odds artık doğru endpoint’ten çekiliyor.
+Default 2.0 varsayımı kaldırıldı; gerçek oranlar karar hattına giriyor.
+Minimum odds + value bet devrede; performans tablolarındaki odds kolonları dolacak.
+Cache + concurrency ile performans ve limitler korunuyor.
+İstersen odds/live ve fixtures/ JSON’larından 1-2 örnek paylaş; select_best_odds’i birebir şemana göre optimize edip, Over/Under, BTTS, Next Goal mapping’ini netleştireyim.

@@ -1,0 +1,277 @@
+⚡️ Mükemmel. Aşağıya "lastBroadcastMinute guard + forced broadcast" + "WebSocket invalidation" patch'ini tam uygulanabilir halde bırakıyorum.
+
+Patch: Minute-Based Broadcast Guard + Frontend Auto-Refresh
+1) Backend — core-engine.ts (veya Python equivalent)
+TypeScript (core-engine.ts)
+ts
+Copy
+// core-engine.ts
+export class CoreEngine {
+  private matches: Map<string, MatchState> = new Map();
+  
+  async processLiveMatches() {
+    const liveMatches = await this.adapter.fetchLiveMatches();
+    
+    for (const raw of liveMatches) {
+      const normalized = await this.adapter.normalizeFixture(raw);
+      if (!normalized) continue;
+      
+      const matchId = normalized.matchId;
+      let match = this.matches.get(matchId);
+      
+      if (!match) {
+        match = this.createMatchState(normalized);
+        this.matches.set(matchId, match);
+      }
+      
+      // ✅ Minute Override Guard + Broadcast Trigger
+      const prevMinute = match.lastBroadcastMinute || 0;
+      const normalizedMinute = normalized.minute;
+      
+      // Dakika güncelle (guard zaten normalize'da uygulandı)
+      match.minute = normalizedMinute;
+      
+      // Eğer dakika ilerledi → broadcast zorla
+      if (normalizedMinute > prevMinute) {
+        match.lastBroadcastMinute = normalizedMinute;
+        
+        this.logger.debug(
+          `📡 BROADCAST: ${match.home} vs ${match.away} | minute=${normalizedMinute} (prev=${prevMinute})`
+        );
+        
+        // Frontend'e gönder
+        this.broadcastActiveSignals();
+      }
+      
+      // ... diğer sinyal üretim mantığı ...
+    }
+  }
+  
+  private broadcastActiveSignals() {
+    const activeSignals = Array.from(this.matches.values())
+      .filter(m => m.hasActiveSignal)
+      .map(m => this.serializeSignal(m));
+    
+    this.wsServer.emit("ACTIVE_SIGNAL_UPDATE", activeSignals);
+    this.logger.debug(`📡 Broadcast sent: ${activeSignals.length} signals`);
+  }
+  
+  private serializeSignal(match: MatchState) {
+    return {
+      id: match.id,
+      matchId: match.matchId,
+      home: match.home,
+      away: match.away,
+      minute: match.minute,              // ← normalized minute
+      rawMinute: match.rawMinute,        // debug
+      confidence: match.confidence,
+      market: match.market,
+      ttlLeft: match.ttlLeft,
+      meta: {
+        usedCache: match.meta?.usedCache,
+        stale: match.meta?.stale,
+        guardApplied: match.meta?.guardApplied,
+      },
+    };
+  }
+}
+
+// MatchState interface'ine ekle:
+interface MatchState {
+  // ... mevcut alanlar ...
+  minute: number;
+  rawMinute?: number;
+  lastBroadcastMinute?: number;  // ← yeni alan
+  meta?: {
+    usedCache?: boolean;
+    stale?: boolean;
+    guardApplied?: boolean;
+  };
+}
+Python (core_engine.py)
+python
+Copy
+# core_engine.py
+import asyncio
+from typing import Dict, List
+from dataclasses import dataclass, field
+
+@dataclass
+class MatchState:
+    match_id: str
+    home: str
+    away: str
+    minute: int = 0
+    raw_minute: int = 0
+    last_broadcast_minute: int = 0  # ← yeni alan
+    confidence: float = 0.0
+    market: str = ""
+    ttl_left: int = 0
+    has_active_signal: bool = False
+    meta: dict = field(default_factory=dict)
+
+class CoreEngine:
+    def __init__(self, adapter, ws_server, logger):
+        self.adapter = adapter
+        self.ws_server = ws_server
+        self.logger = logger
+        self.matches: Dict[str, MatchState] = {}
+    
+    async def process_live_matches(self):
+        live_matches = await self.adapter.fetch_live_matches()
+        
+        for raw in live_matches:
+            normalized = await self.adapter.normalize_fixture(raw)
+            if not normalized:
+                continue
+            
+            match_id = normalized["match_id"]
+            match = self.matches.get(match_id)
+            
+            if not match:
+                match = self._create_match_state(normalized)
+                self.matches[match_id] = match
+            
+            # ✅ Minute Override Guard + Broadcast Trigger
+            prev_minute = match.last_broadcast_minute
+            normalized_minute = normalized["minute"]
+            
+            # Dakika güncelle
+            match.minute = normalized_minute
+            match.raw_minute = normalized.get("raw_minute", 0)
+            match.meta = normalized.get("meta", {})
+            
+            # Eğer dakika ilerledi → broadcast zorla
+            if normalized_minute > prev_minute:
+                match.last_broadcast_minute = normalized_minute
+                
+                self.logger.debug(
+                    "📡 BROADCAST: %s vs %s | minute=%d (prev=%d)",
+                    match.home, match.away, normalized_minute, prev_minute
+                )
+                
+                # Frontend'e gönder
+                await self.broadcast_active_signals()
+            
+            # ... diğer sinyal üretim mantığı ...
+    
+    async def broadcast_active_signals(self):
+        active_signals = [
+            self._serialize_signal(m)
+            for m in self.matches.values()
+            if m.has_active_signal
+        ]
+        
+        await self.ws_server.emit("ACTIVE_SIGNAL_UPDATE", active_signals)
+        self.logger.debug("📡 Broadcast sent: %d signals", len(active_signals))
+    
+    def _serialize_signal(self, match: MatchState):
+        return {
+            "id": match.match_id,
+            "matchId": match.match_id,
+            "home": match.home,
+            "away": match.away,
+            "minute": match.minute,              # ← normalized minute
+            "rawMinute": match.raw_minute,       # debug
+            "confidence": match.confidence,
+            "market": match.market,
+            "ttlLeft": match.ttl_left,
+            "meta": match.meta,
+        }
+2) Frontend — useActiveSignals() + WebSocket invalidation
+tsx
+Copy
+// hooks/useActiveSignals.ts
+import { useEffect } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { socket } from "@/lib/socket";
+
+export function useActiveSignals() {
+  const queryClient = useQueryClient();
+  
+  // Initial fetch + polling fallback (30 sn)
+  const query = useQuery({
+    queryKey: ["activeSignals"],
+    queryFn: async () => {
+      const res = await fetch("/api/signals");
+      if (!res.ok) throw new Error("Failed to fetch signals");
+      return res.json();
+    },
+    refetchInterval: 30000, // 30 sn fallback
+    refetchOnWindowFocus: true,
+  });
+  
+  // ✅ WebSocket listener: yeni dakika geldiğinde cache'i güncelle
+  useEffect(() => {
+    const handleUpdate = (updatedSignals: any[]) => {
+      queryClient.setQueryData(["activeSignals"], { signals: updatedSignals });
+      console.debug("📡 WS: Active signals updated", updatedSignals.length);
+    };
+    
+    socket.on("ACTIVE_SIGNAL_UPDATE", handleUpdate);
+    
+    return () => {
+      socket.off("ACTIVE_SIGNAL_UPDATE", handleUpdate);
+    };
+  }, [queryClient]);
+  
+  return query;
+}
+3) SignalCard — displayMinute artık otomatik güncellenir
+tsx
+Copy
+// components/SignalCard.tsx
+export function SignalCard({ signal }: { signal: ActiveSignal }) {
+  // WebSocket her dakika güncelleyeceği için local state'e gerek yok
+  // Ama isterseniz UI-side auto-increment de eklenebilir (opsiyonel)
+  
+  return (
+    <div className="signal-card">
+      <div className="minute-badge">
+        {signal.minute}' {/* ← WebSocket'ten gelen normalized minute */}
+      </div>
+      
+      {/* Debug (dev ortamında) */}
+      {process.env.NODE_ENV === "development" && (
+        <small className="text-muted">
+          backend: {signal.minute}' | raw: {signal.rawMinute}' | guard: {signal.meta?.guardApplied ? "✓" : "✗"}
+        </small>
+      )}
+      
+      {signal.meta?.stale && <span className="badge badge-warning">⚠ stale</span>}
+      
+      <div className="teams">
+        {signal.home} vs {signal.away}
+      </div>
+      <div className="market">{signal.market}</div>
+      <div className="confidence">{signal.confidence}%</div>
+    </div>
+  );
+}
+4) Log beklentisi
+Backend:
+
+📡 BROADCAST: Arsenal vs Chelsea | minute=28 (prev=27)
+📡 Broadcast sent: 3 signals
+Frontend console:
+
+📡 WS: Active signals updated 3
+5) Hızlı test
+Backend restart sonrası log izle:
+bash
+Copy
+tail -f logs/scout_core.log | grep "📡 BROADCAST"
+Frontend console'da:
+Her dakika "📡 WS: Active signals updated" görünmeli.
+UI'de kartlarda dakika 27 → 28 → 29 diye şıkır şıkır akmalı.
+Özet
+Katman	Değişiklik	Etki
+Backend (core-engine)	lastBroadcastMinute guard + forced broadcast	Dakika ilerlediğinde WS emit zorunlu
+Frontend (useActiveSignals)	WS listener + setQueryData	Cache otomatik güncellenir, re-render tetiklenir
+UI (SignalCard)	signal.minute render	Normalized minute doğrudan gösterilir
+Bu patch'le:
+
+Backend her dakika ilerlemesinde broadcast zorlar.
+Frontend WS dinleyerek cache'i anında günceller.
+UI donmaz; 27 → 28 → 29 diye akar.
+Log'da "📡 BROADCAST" ile izlersin.

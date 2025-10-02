@@ -1,0 +1,151 @@
+Tam teşhis: Backend cache/elapsed ile 11 hesaplıyor ama UI hâlâ raw time.minute (0) okuyor. Aşağıya "normalizedMinute" alanını API'den UI'ye taşıyan tek-seferlik patch bırakıyorum.
+
+Patch: normalizedMinute → API → UI
+1) Backend — normalize sırasında effectiveMinute/normalizedMinute alanını ekle
+python
+Copy
+# sm_client.py veya normalize fonksiyonunda
+from minute_utils import parse_minute, apply_minute_cache, is_stale, maybe_hydrate_from_inplay
+
+async def _normalize_match_sm(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    fid = str(raw.get("id") or raw.get("fixture_id") or raw.get("match_id"))
+    
+    # 1) Çok katmanlı parse
+    raw_minute = parse_minute(raw)
+    
+    # 2) Cache + elapsed
+    normalized_minute, used_cache = apply_minute_cache(fid, raw_minute)
+    
+    # 3) Stale/inplay fallback
+    if normalized_minute == 0 or is_stale(fid):
+        normalized_minute = await maybe_hydrate_from_inplay(fid, normalized_minute, fetch_inplay_fixture)
+    
+    # 4) Hâlâ 0 ise pipeline dışla (opsiyonel)
+    if normalized_minute == 0:
+        logger.debug("Dropping fixture %s: minute=0 after all fallbacks", fid)
+        return None
+    
+    # 5) Hem raw hem normalized'ı döndür (debug için)
+    return {
+        "match_id": fid,
+        "minute": normalized_minute,           # ← UI bundan okuyacak
+        "raw_minute": raw_minute,              # debug
+        "home_team": ...,
+        "away_team": ...,
+        # ...
+        "meta": {
+            "used_cache": used_cache,
+            "stale": is_stale(fid),
+        }
+    }
+2) API — Active Signal Service snapshot'a normalizedMinute ekle
+python
+Copy
+# api/server.py (veya signal serializer)
+def _ui_signal(s):
+    return {
+        "id": s.id,
+        "match_id": s.match_id,
+        "market": s.market,
+        "home": s.home,
+        "away": s.away,
+        "confidence": float(s.confidence) if s.confidence is not None else None,
+        "minute": int(s.minute) if s.minute is not None else 0,  # ← normalized minute buraya geliyor
+        "raw_minute": getattr(s, "raw_minute", None),            # debug (opsiyonel)
+        "ttl_left": int(s.time_left()),
+        "state": s.state,
+        "odds": getattr(s, "odds", None),
+        "bookmaker": (s.meta or {}).get("bookmaker"),
+        "value_bet": (s.meta or {}).get("value_bet"),
+        "used_cache": (s.meta or {}).get("used_cache"),
+        "stale": (s.meta or {}).get("stale"),
+    }
+3) TypeScript adapter (eğer Node/TS tarafında da normalize ediyorsan)
+ts
+Copy
+// sportmonks-adapter.ts
+import { parseMinute, applyMinuteCache, isStaleMinute, maybeHydrateFromInplay } from "./minute_utils";
+
+export async function normalizeFixture(raw: any): Promise<NormalizedMatch | null> {
+  const id = String(raw?.id ?? raw?.fixture_id);
+  
+  // 1) Çok katmanlı parse
+  let rawMinute = parseMinute(raw);
+  
+  // 2) Cache + elapsed
+  const cacheRes = applyMinuteCache(id, rawMinute);
+  let normalizedMinute = cacheRes.minute;
+  
+  // 3) Stale/inplay fallback
+  if (normalizedMinute === 0 || isStaleMinute(id)) {
+    normalizedMinute = await maybeHydrateFromInplay(id, normalizedMinute, fetchInplayFixture);
+  }
+  
+  // 4) Hâlâ 0 ise drop (opsiyonel)
+  if (normalizedMinute === 0) {
+    console.debug(`Dropping fixture ${id}: minute=0 after all fallbacks`);
+    return null;
+  }
+  
+  return {
+    matchId: id,
+    minute: normalizedMinute,        // ← UI bundan okuyacak
+    rawMinute,                       // debug
+    home: extractHome(raw),
+    away: extractAway(raw),
+    // ...
+    meta: {
+      usedCache: cacheRes.usedCache,
+      stale: isStaleMinute(id),
+    },
+  };
+}
+4) Frontend — UI'yi signal.minute (artık normalized) üzerinden render et
+tsx
+Copy
+// SignalCard.tsx (veya ilgili component)
+export function SignalCard({ signal }: { signal: ActiveSignal }) {
+  return (
+    <div className="signal-card">
+      <div className="minute-badge">
+        {signal.minute}' {/* ← artık normalized minute */}
+      </div>
+      
+      {/* Debug için (geliştirme ortamında göster) */}
+      {process.env.NODE_ENV === "development" && signal.rawMinute !== undefined && (
+        <small className="text-muted">
+          raw: {signal.rawMinute}' | cache: {signal.meta?.usedCache ? "✓" : "✗"}
+        </small>
+      )}
+      
+      {/* Stale uyarısı (opsiyonel) */}
+      {signal.meta?.stale && (
+        <span className="badge badge-warning">⚠ stale</span>
+      )}
+      
+      {/* ... diğer alanlar ... */}
+    </div>
+  );
+}
+5) Log doğrulama (backend)
+python
+Copy
+logger.info(
+    "DISPLAY MINUTE: fixture=%s | raw=%d | normalized=%d | cache=%s | stale=%s",
+    fid, raw_minute, normalized_minute, used_cache, is_stale(fid)
+)
+Beklenen log:
+
+DISPLAY MINUTE: fixture=12345 | raw=0 | normalized=23 | cache=True | stale=False
+6) Hızlı test
+Backend restart sonrası API'den /signals çek:
+bash
+Copy
+curl http://localhost:8000/signals | jq '.signals[] | {id, minute, raw_minute, used_cache}'
+Frontend'de kartlarda artık 23' gibi gerçek dakika görünmeli; raw=0 debug alanında kalmalı.
+Özet
+Backend: minute alanına artık normalizedMinute (cache + elapsed + fallback) yazılıyor.
+API: minute zaten normalized; raw_minute debug için opsiyonel.
+UI: signal.minute okuyunca doğrudan normalized değeri alıyor; eski match.time.minute artık kullanılmıyor.
+Sonuç: Üstte "0'" yerine "23'" görünecek; alttaki "11m" ile tutarlı hale gelecek.
+İstersen bu patch'i dosya bazında (sm_client.py, server.py, SignalCard.tsx) diff formatında çıkarayım; doğrudan git apply ile geçersin.

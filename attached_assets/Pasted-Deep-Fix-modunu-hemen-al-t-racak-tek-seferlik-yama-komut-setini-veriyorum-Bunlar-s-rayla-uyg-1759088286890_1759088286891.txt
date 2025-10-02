@@ -1,0 +1,161 @@
+Deep Fix modunu hemen çalıştıracak “tek seferlik yama + komut” setini veriyorum. Bunları sırayla uygula; ilk 10 dakikada ham JSON’u görür, 1–2 saat içinde kök sebebi buluruz.
+
+Adım 1) Doğrudan API Hız Testi (Terminal)
+Replit/Contabo shell’de sadece bu komutu çalıştır:
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&include=participants;teams;localteam;visitorteam;statistics;odds" | head -n 80
+Kontrol et:
+localteam.data.name ve visitorteam.data.name
+time.minute veya minutes
+scores.home / scores.away
+Not: Eğer boş/eksikse, include varyasyonlarını sırayla dene:
+
+bash
+Copy
+# Varyasyonlar
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&include=participants;participants.team" | head -n 80
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&include=localteam;visitorteam" | head -n 80
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&include=teams;teams.country" | head -n 80
+Adım 2) sm_client.py’ye “ham dump garantisi” (geçici patch)
+data_providers/sm_client.py içinde get_live_matches() fonksiyonunun BAŞINA bu bloğu ekle ve fonksiyondan döndür:
+python
+Copy
+logger.debug("DEBUG-ENTRY sm_client.get_live_matches()")
+
+raw_url = f"{SM_BASE_URL}/livescores"
+params = {
+    "api_token": SM_TOKEN,
+    "include": "participants;teams;localteam;visitorteam;statistics;odds"
+}
+test_json = await safe_request(raw_url, params=params)
+
+# Dump klasörü
+Path("logs").mkdir(parents=True, exist_ok=True)
+with open("logs/sm_raw_first.json", "w", encoding="utf-8") as f:
+    json.dump(test_json, f, indent=2, ensure_ascii=False)
+logger.debug("DEBUG-DUMP sm_raw_first.json written")
+return []
+Bu patch ile core akış ilerlemeden ham yanıt logs/sm_raw_first.json’a yazılır.
+Adım 3) Çalıştır ve İncele
+Replit:
+Run’a bas.
+Contabo:
+systemctl restart scout_core
+journalctl -fu scout_core
+Loglarda şu satırları görmelisin:
+DEBUG-ENTRY sm_client.get_live_matches()
+DEBUG-DUMP sm_raw_first.json written
+Ham dump’ı aç:
+bash
+Copy
+ls -lh logs/
+tail -n 120 logs/sm_raw_first.json
+İpucu: Hızlı özet görmek için küçük bir tek satır Python:
+
+bash
+Copy
+python - <<'PY'
+import json; d=json.load(open("logs/sm_raw_first.json")); 
+items=d.get("data", d) or []
+def g(x,*ks):
+    for k in ks:
+        x=x.get(k) if isinstance(x,dict) else None
+        if x is None: return None
+    return x
+for i,it in enumerate(items[:10]):
+    h = (g(it,"localteam","data","name") or g(it,"participants","data",0,"name") or g(it,"teams","data",0,"name"))
+    a = (g(it,"visitorteam","data","name") or g(it,"participants","data",1,"name") or g(it,"teams","data",1,"name"))
+    minute = g(it,"time","minute") or it.get("minutes")
+    sh = g(it,"scores","home")
+    sa = g(it,"scores","away")
+    print(i, h, "vs", a, "| minute:", minute, "| score:", sh, "-", sa)
+PY
+Adım 4) Include varyasyon testi (kod içinden)
+Eğer logs/sm_raw_first.json zayıf/boş görünüyorsa, sm_client.py patch içindeki params["include"] alanını sırayla şu değerlerle değiştirip tekrar çalıştır:
+"participants;participants.team"
+"localteam;visitorteam"
+"teams;teams.country"
+Her değişiklik sonrası tekrar dump al:
+systemctl restart scout_core veya Replit’te Run
+tail logs/sm_raw_first.json
+Adım 5) Sonuca göre hızlı düzeltme
+Durum A: Dump içinde isim/dakika/score VAR ama bizim normalleştirme bulamıyor:
+_extract_team_names ve minute/score çıkarımlarını bu fallback’lerle güncelle:
+Takım isimleri fallback (sm_client.py):
+
+python
+Copy
+def _extract_team_names(m):
+    # 1) participants
+    try:
+        parts = m.get("participants") or m.get("participants", {}).get("data")
+        if isinstance(parts, dict):
+            parts = parts.get("data")
+        if isinstance(parts, list) and len(parts) >= 2:
+            h = parts[0].get("name") or parts[0].get("short_code") or ""
+            a = parts[1].get("name") or parts[1].get("short_code") or ""
+            if h and a: return h, a
+    except: pass
+    # 2) localteam/visitorteam
+    try:
+        lt = (((m.get("localteam") or {}).get("data")) or {}).get("name")
+        vt = (((m.get("visitorteam") or {}).get("data")) or {}).get("name")
+        if lt and vt: return lt, vt
+    except: pass
+    # 3) teams
+    try:
+        teams = m.get("teams") or m.get("teams", {}).get("data")
+        if isinstance(teams, list) and len(teams) >= 2:
+            h = teams[0].get("name") or ""
+            a = teams[1].get("name") or ""
+            if h and a: return h, a
+    except: pass
+    return "Unknown", "Unknown"
+Dakika ve skor fallback (sm_client.py _normalize_match):
+
+python
+Copy
+def _normalize_match(raw):
+    minute = (raw.get("time") or {}).get("minute") or raw.get("minutes") or 0
+    scores = raw.get("scores") or {}
+    home_g = scores.get("home") if isinstance(scores, dict) else None
+    away_g = scores.get("away") if isinstance(scores, dict) else None
+    # bazı şemalarda score { localteam_score, visitorteam_score } olabilir:
+    if home_g is None:
+        home_g = raw.get("localteam_score")
+    if away_g is None:
+        away_g = raw.get("visitorteam_score")
+    # ... geri kalan alanlar aynı
+Durum B: Dump BOŞ veya format “beklenenden farklı”:
+Token/plan ve endpoint doğrulaması gerekli. Aşağıdaki iki kontrolü yap:
+Token gerçekten geçerli mi?
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/countries?api_token=$SPORTMONKS_API_KEY" | head -n 40
+v3/v4 farkı var mı? Dokümanlarını kontrol et; livescores “include” sözdizimi değişmiş olabilir.
+Geçici çözüm: Include’u tamamen kaldırıp ham temel alanları al:
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY" | head -n 80
+Ardından dönen id’lerle tekil endpoint’lere relation çekmek (2 aşamalı) bir workaround olabilir.
+Yardımcı: Logger ve env ayarları (görünürlük maksimum)
+Terminal:
+bash
+Copy
+export LOG_LEVEL=DEBUG
+export LOG_TO_STDOUT=1
+export DUMP_SM_RAW=1
+mkdir -p logs
+Systemd (Contabo):
+Environment=LOG_LEVEL=DEBUG
+Environment=LOG_TO_STDOUT=1
+Environment=DUMP_SM_RAW=1
+Beklenen hızlı geri bildirim akışı
+DEBUG-ENTRY ve DEBUG-DUMP loglarını hemen görmelisin.
+logs/sm_raw_first.json dosyası ham gerçekliğimizi gösterecek.
+Oradan 3 sahne çıkacak:
+Data düzgün → normalize/fallback patch ile biter.
+Data var ama include ile gelmiyor → doğru include kombinasyonunu sabitleriz.
+Data boş → token/endpoint/versiyon konusu; doğrulayıp yeni şemaya uyarlarız.
+Hazırım: Dump’tan 2–3 örnek item paylaş, isim/dakika/score alanlarını bizle birlikte tam adrese bağlayıp tek satır düzeltme ile finalize edelim.

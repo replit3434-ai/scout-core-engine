@@ -1,0 +1,618 @@
+"""
+RL Agent (Reinforcement Learning Agent)
+======================================
+
+Market Selector'dan gelen aday sinyalleri geçmiş performans ve 
+ödül/ceza mantığı ile değerlendirir, final sinyali üretir.
+"""
+
+import logging
+import numpy as np
+import json
+import pickle
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+from collections import defaultdict, deque
+
+
+class RLAgent:
+    """
+    Reinforcement Learning tabanlı sinyal karar motoru
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.logger = logging.getLogger("rl_agent")
+        
+        # RL parametreleri
+        self.learning_rate = 0.01
+        self.discount_factor = 0.95
+        self.epsilon = 0.1  # Exploration rate
+        self.epsilon_decay = 0.995
+        self.min_epsilon = 0.01
+        
+        # State ve action spaces
+        self.state_features = [
+            'minute', 'score_diff', 'shots_ratio', 'possession_diff',
+            'corners_ratio', 'fouls_ratio', 'momentum_home', 'momentum_away',
+            'market_confidence', 'data_quality', 'league_strength'
+        ]
+        
+        self.actions = [
+            'generate_signal', 'skip_signal', 'wait_more_data'
+        ]
+        
+        # Q-table ve experience replay
+        self.q_table = defaultdict(lambda: defaultdict(float))
+        self.experience_buffer = deque(maxlen=10000)
+        self.signal_history = deque(maxlen=1000)
+        
+        # Performance tracking
+        self.performance_metrics = {
+            'total_signals': 0,
+            'successful_signals': 0,
+            'failed_signals': 0,
+            'win_rate': 0.0,
+            'avg_confidence': 0.0,
+            'market_performance': defaultdict(lambda: {'wins': 0, 'total': 0})
+        }
+        
+        # Model dosyası
+        self.model_file = "rl_agent_model.pkl"
+        self._load_model()
+        
+        self.logger.info("🤖 RL Agent başlatıldı")
+    
+    async def generate_signals(self, combined_data: Dict, candidate_markets: List[Dict]) -> List[Dict]:
+        """
+        Aday marketleri değerlendirerek final sinyalleri üret
+        
+        Args:
+            combined_data: Birleşik maç verisi
+            candidate_markets: Market Selector'dan gelen aday marketler
+            
+        Returns:
+            Final sinyal listesi
+        """
+        try:
+            if not candidate_markets:
+                return []
+            
+            final_signals = []
+            
+            for candidate in candidate_markets:
+                # State'i hesapla
+                state = self._extract_state(combined_data, candidate)
+                
+                # Action seç (RL decision)
+                action = self._select_action(state, candidate)
+                
+                if action == 'generate_signal':
+                    # Sinyal üret
+                    signal = self._create_signal(combined_data, candidate, state)
+                    final_signals.append(signal)
+                    
+                    # Experience'ı kaydet
+                    self._record_experience(state, action, candidate)
+                    
+                elif action == 'wait_more_data':
+                    # Daha fazla veri bekle - düşük güvenle sinyal üret
+                    candidate['confidence'] *= 0.8
+                    if candidate['confidence'] > 0.4:
+                        signal = self._create_signal(combined_data, candidate, state)
+                        signal['status'] = 'waiting'
+                        final_signals.append(signal)
+                
+                # Skip durumunda hiçbir şey yapma
+            
+            # Model güncelle
+            if len(self.experience_buffer) > 100:
+                self._update_model()
+            
+            self.logger.debug(f"🤖 RL Agent: {len(final_signals)} final sinyal üretildi")
+            return final_signals
+            
+        except Exception as e:
+            self.logger.error(f"❌ RL Agent sinyal üretimi hatası: {e}")
+            return []
+    
+    def _extract_state(self, combined_data: Dict, candidate: Dict) -> np.ndarray:
+        """
+        Mevcut durumdan state vector'ü çıkar
+        
+        Args:
+            combined_data: Maç verisi
+            candidate: Aday market
+            
+        Returns:
+            State vector
+        """
+        try:
+            match_data = combined_data['match']
+            
+            # Temel maç bilgileri
+            minute = match_data.get('time', {}).get('minute', 0) / 90.0  # Normalize
+            
+            # Skor farkı
+            scores = match_data.get('scores', [])
+            home_score = away_score = 0
+            for score in scores:
+                if score.get('description') == 'CURRENT':
+                    home_score = score.get('score', {}).get('localteam', 0)
+                    away_score = score.get('score', {}).get('visitorteam', 0)
+            
+            score_diff = (home_score - away_score) / 5.0  # Normalize
+            
+            # İstatistikler
+            stats = match_data.get('statistics', {})
+            home_stats = stats.get('home', {})
+            away_stats = stats.get('away', {})
+            
+            # Şut oranı
+            home_shots = home_stats.get('shots_total', 0)
+            away_shots = away_stats.get('shots_total', 0)
+            total_shots = home_shots + away_shots
+            shots_ratio = (home_shots / total_shots) if total_shots > 0 else 0.5
+            
+            # Possession farkı
+            home_poss = home_stats.get('possession', 50)
+            away_poss = away_stats.get('possession', 50)
+            possession_diff = (home_poss - away_poss) / 100.0
+            
+            # Korner oranı
+            home_corners = home_stats.get('corners', 0)
+            away_corners = away_stats.get('corners', 0)
+            total_corners = home_corners + away_corners
+            corners_ratio = (home_corners / total_corners) if total_corners > 0 else 0.5
+            
+            # Faul oranı
+            home_fouls = home_stats.get('fouls', 0)
+            away_fouls = away_stats.get('fouls', 0)
+            total_fouls = home_fouls + away_fouls
+            fouls_ratio = (home_fouls / total_fouls) if total_fouls > 0 else 0.5
+            
+            # Momentum (basit hesaplama)
+            momentum_home = self._calculate_simple_momentum(match_data, 'home')
+            momentum_away = self._calculate_simple_momentum(match_data, 'away')
+            
+            # Market özellikleri
+            market_confidence = candidate.get('confidence', 0.5)
+            data_quality = candidate.get('data_quality', 0.5)
+            
+            # Lig gücü (basit)
+            league_strength = 0.7  # Placeholder
+            
+            state = np.array([
+                minute, score_diff, shots_ratio, possession_diff,
+                corners_ratio, fouls_ratio, momentum_home, momentum_away,
+                market_confidence, data_quality, league_strength
+            ])
+            
+            return state
+            
+        except Exception as e:
+            self.logger.error(f"❌ State extraction hatası: {e}")
+            return np.zeros(len(self.state_features))
+    
+    def _select_action(self, state: np.ndarray, candidate: Dict) -> str:
+        """
+        RL policy ile action seç
+        
+        Args:
+            state: Mevcut state
+            candidate: Aday market
+            
+        Returns:
+            Seçilen action
+        """
+        try:
+            # State'i string'e çevir (Q-table için)
+            state_key = self._state_to_key(state)
+            
+            # Epsilon-greedy policy
+            if np.random.random() < self.epsilon:
+                # Exploration
+                action = np.random.choice(self.actions)
+            else:
+                # Exploitation - en iyi Q-value'yu seç
+                q_values = [self.q_table[state_key][action] for action in self.actions]
+                best_action_idx = np.argmax(q_values)
+                action = self.actions[best_action_idx]
+            
+            # Güven seviyesi kontrolü
+            confidence = candidate.get('confidence', 0.5)
+            
+            if confidence < 0.4:
+                action = 'skip_signal'
+            elif confidence < 0.6 and action == 'generate_signal':
+                action = 'wait_more_data'
+            
+            return action
+            
+        except Exception as e:
+            self.logger.error(f"❌ Action selection hatası: {e}")
+            return 'skip_signal'
+    
+    def _create_signal(self, combined_data: Dict, candidate: Dict, state: np.ndarray) -> Dict:
+        """
+        Final sinyal oluştur
+        
+        Args:
+            combined_data: Maç verisi
+            candidate: Aday market
+            state: State vector
+            
+        Returns:
+            Final sinyal
+        """
+        try:
+            match_data = combined_data['match']
+            
+            # RL confidence adjustment
+            rl_confidence = self._calculate_rl_confidence(state, candidate)
+            final_confidence = (candidate['confidence'] + rl_confidence) / 2
+            
+            signal = {
+                'id': f"signal_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{np.random.randint(1000, 9999)}",
+                'match_id': match_data.get('id'),
+                'league_id': match_data.get('league_id'),
+                'market': candidate['market'],
+                'selection': candidate['selection'],
+                'confidence': final_confidence,
+                'original_confidence': candidate['confidence'],
+                'rl_confidence': rl_confidence,
+                'reasoning': candidate.get('reasoning', ''),
+                'rl_reasoning': self._generate_rl_reasoning(state, candidate),
+                'data_quality': candidate.get('data_quality', 0.5),
+                'created_at': datetime.now(),
+                'status': 'active',
+                'source': 'rl_agent_v6',
+                'state_features': state.tolist(),
+                'expected_outcome': None,  # Sonuç takibi için
+                'actual_outcome': None
+            }
+            
+            # Signal history'ye ekle
+            self.signal_history.append(signal.copy())
+            
+            # Performance tracking
+            self.performance_metrics['total_signals'] += 1
+            
+            return signal
+            
+        except Exception as e:
+            self.logger.error(f"❌ Sinyal oluşturma hatası: {e}")
+            return {}
+    
+    def _calculate_rl_confidence(self, state: np.ndarray, candidate: Dict) -> float:
+        """
+        RL modelinden confidence hesapla
+        
+        Args:
+            state: State vector
+            candidate: Aday market
+            
+        Returns:
+            RL confidence score
+        """
+        try:
+            state_key = self._state_to_key(state)
+            market_type = candidate['market']
+            
+            # Market-specific performance
+            market_perf = self.performance_metrics['market_performance'][market_type]
+            market_win_rate = (market_perf['wins'] / market_perf['total']) if market_perf['total'] > 0 else 0.5
+            
+            # Q-value based confidence
+            q_value = self.q_table[state_key]['generate_signal']
+            q_confidence = 1 / (1 + np.exp(-q_value))  # Sigmoid
+            
+            # Combine factors
+            rl_confidence = (market_win_rate * 0.6) + (q_confidence * 0.4)
+            
+            return np.clip(rl_confidence, 0.1, 0.9)
+            
+        except Exception as e:
+            self.logger.error(f"❌ RL confidence hesaplama hatası: {e}")
+            return 0.5
+    
+    def _generate_rl_reasoning(self, state: np.ndarray, candidate: Dict) -> str:
+        """
+        RL kararı için açıklama üret
+        
+        Args:
+            state: State vector
+            candidate: Aday market
+            
+        Returns:
+            RL reasoning string
+        """
+        try:
+            market_type = candidate['market']
+            market_perf = self.performance_metrics['market_performance'][market_type]
+            
+            if market_perf['total'] > 0:
+                win_rate = market_perf['wins'] / market_perf['total']
+                return f"RL Model: {market_type} geçmiş başarı oranı %{win_rate*100:.1f}"
+            else:
+                return f"RL Model: {market_type} için yeni öğrenme"
+                
+        except Exception:
+            return "RL Model: Standart değerlendirme"
+    
+    def _calculate_simple_momentum(self, match_data: Dict, team: str) -> float:
+        """
+        Basit momentum hesaplama
+        
+        Args:
+            match_data: Maç verisi
+            team: 'home' veya 'away'
+            
+        Returns:
+            Momentum score (0-1)
+        """
+        try:
+            stats = match_data.get('statistics', {}).get(team, {})
+            
+            # Basit momentum faktörleri
+            attacks = stats.get('attacks', 0)
+            shots = stats.get('shots_total', 0)
+            corners = stats.get('corners', 0)
+            
+            # Normalize et
+            momentum = (attacks / 100) + (shots / 20) + (corners / 10)
+            return np.clip(momentum / 3, 0, 1)
+            
+        except Exception:
+            return 0.5
+    
+    def _state_to_key(self, state: np.ndarray) -> str:
+        """
+        State vector'ü Q-table key'ine çevir
+        
+        Args:
+            state: State vector
+            
+        Returns:
+            State key string
+        """
+        try:
+            # State'i discrete bins'e böl
+            discretized = np.round(state * 10).astype(int)
+            return '_'.join(map(str, discretized))
+            
+        except Exception:
+            return "default_state"
+    
+    def _record_experience(self, state: np.ndarray, action: str, candidate: Dict):
+        """
+        Experience'ı kaydet
+        
+        Args:
+            state: State vector
+            action: Seçilen action
+            candidate: Aday market
+        """
+        try:
+            experience = {
+                'state': state.copy(),
+                'action': action,
+                'market': candidate['market'],
+                'confidence': candidate['confidence'],
+                'timestamp': datetime.now()
+            }
+            
+            self.experience_buffer.append(experience)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Experience kayıt hatası: {e}")
+    
+    def _update_model(self):
+        """
+        Q-table'ı güncelle (basit Q-learning)
+        """
+        try:
+            # Son experience'ları al
+            recent_experiences = list(self.experience_buffer)[-50:]
+            
+            for exp in recent_experiences:
+                state_key = self._state_to_key(exp['state'])
+                action = exp['action']
+                
+                # Reward hesapla (placeholder - gerçek sonuçlarla güncellenecek)
+                reward = self._calculate_reward(exp)
+                
+                # Q-value güncelle
+                old_q = self.q_table[state_key][action]
+                self.q_table[state_key][action] = old_q + self.learning_rate * (reward - old_q)
+            
+            # Epsilon decay
+            self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+            
+            # Model kaydet
+            self._save_model()
+            
+        except Exception as e:
+            self.logger.error(f"❌ Model güncelleme hatası: {e}")
+    
+    def _calculate_reward(self, experience: Dict) -> float:
+        """
+        Experience için reward hesapla
+        
+        Args:
+            experience: Experience dictionary
+            
+        Returns:
+            Reward value
+        """
+        try:
+            # Basit reward sistemi
+            action = experience['action']
+            confidence = experience['confidence']
+            
+            if action == 'generate_signal':
+                # Yüksek güvenli sinyaller için pozitif reward
+                return confidence - 0.5
+            elif action == 'skip_signal':
+                # Düşük güvenli sinyalleri skip etmek için pozitif reward
+                return 0.5 - confidence
+            else:  # wait_more_data
+                return 0.1
+                
+        except Exception:
+            return 0.0
+    
+    def update_signal_outcome(self, signal_id: str, outcome: bool, profit: float = 0.0):
+        """
+        Sinyal sonucunu güncelle (gerçek sonuç geldiğinde)
+        
+        Args:
+            signal_id: Sinyal ID'si
+            outcome: True/False (başarılı/başarısız)
+            profit: Kar/zarar miktarı
+        """
+        try:
+            # Signal history'de bul ve güncelle
+            for signal in self.signal_history:
+                if signal.get('id') == signal_id:
+                    signal['actual_outcome'] = outcome
+                    signal['profit'] = profit
+                    
+                    # Performance metrics güncelle
+                    if outcome:
+                        self.performance_metrics['successful_signals'] += 1
+                        market_type = signal['market']
+                        self.performance_metrics['market_performance'][market_type]['wins'] += 1
+                    else:
+                        self.performance_metrics['failed_signals'] += 1
+                    
+                    # Win rate güncelle
+                    total = self.performance_metrics['successful_signals'] + self.performance_metrics['failed_signals']
+                    if total > 0:
+                        self.performance_metrics['win_rate'] = self.performance_metrics['successful_signals'] / total
+                    
+                    # Market performance güncelle
+                    market_type = signal['market']
+                    self.performance_metrics['market_performance'][market_type]['total'] += 1
+                    
+                    self.logger.info(f"📊 Sinyal {signal_id} sonucu güncellendi: {outcome}")
+                    break
+            
+            # Model'i yeniden eğit
+            self._retrain_with_outcome(signal_id, outcome, profit)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Sinyal sonucu güncelleme hatası: {e}")
+    
+    def _retrain_with_outcome(self, signal_id: str, outcome: bool, profit: float):
+        """
+        Gerçek sonuçla model'i yeniden eğit
+        
+        Args:
+            signal_id: Sinyal ID'si
+            outcome: Sonuç
+            profit: Kar/zarar
+        """
+        try:
+            # İlgili experience'ı bul
+            for exp in self.experience_buffer:
+                # Experience ile signal'i eşleştir (timestamp bazlı)
+                # Bu kısım daha detaylı implementasyon gerektirir
+                pass
+            
+            # Q-table'ı gerçek sonuçla güncelle
+            # Bu kısım da daha detaylı implementasyon gerektirir
+            
+        except Exception as e:
+            self.logger.error(f"❌ Outcome-based retraining hatası: {e}")
+    
+    def get_performance_report(self) -> Dict:
+        """
+        Performance raporu al
+        
+        Returns:
+            Performance metrics
+        """
+        try:
+            report = self.performance_metrics.copy()
+            
+            # Market-specific win rates
+            market_details = {}
+            for market, perf in self.performance_metrics['market_performance'].items():
+                if perf['total'] > 0:
+                    market_details[market] = {
+                        'win_rate': perf['wins'] / perf['total'],
+                        'total_signals': perf['total'],
+                        'wins': perf['wins']
+                    }
+            
+            report['market_details'] = market_details
+            report['model_parameters'] = {
+                'epsilon': self.epsilon,
+                'learning_rate': self.learning_rate,
+                'q_table_size': len(self.q_table)
+            }
+            
+            return report
+            
+        except Exception as e:
+            self.logger.error(f"❌ Performance raporu hatası: {e}")
+            return {}
+    
+    def _save_model(self):
+        """Model'i dosyaya kaydet"""
+        try:
+            model_data = {
+                'q_table': dict(self.q_table),
+                'performance_metrics': self.performance_metrics,
+                'epsilon': self.epsilon,
+                'signal_history': list(self.signal_history)
+            }
+            
+            with open(self.model_file, 'wb') as f:
+                pickle.dump(model_data, f)
+                
+        except Exception as e:
+            self.logger.error(f"❌ Model kaydetme hatası: {e}")
+    
+    def _load_model(self):
+        """Model'i dosyadan yükle"""
+        try:
+            with open(self.model_file, 'rb') as f:
+                model_data = pickle.load(f)
+                
+                self.q_table = defaultdict(lambda: defaultdict(float), model_data.get('q_table', {}))
+                self.performance_metrics = model_data.get('performance_metrics', self.performance_metrics)
+                self.epsilon = model_data.get('epsilon', self.epsilon)
+                
+                # Signal history'yi deque'ya çevir
+                history_data = model_data.get('signal_history', [])
+                self.signal_history = deque(history_data, maxlen=1000)
+                
+                self.logger.info(f"🤖 RL Model yüklendi - Q-table size: {len(self.q_table)}")
+                
+        except FileNotFoundError:
+            self.logger.info("🤖 Yeni RL Model başlatılıyor")
+        except Exception as e:
+            self.logger.error(f"❌ Model yükleme hatası: {e}")
+    
+    def reset_model(self):
+        """Model'i sıfırla"""
+        try:
+            self.q_table = defaultdict(lambda: defaultdict(float))
+            self.experience_buffer.clear()
+            self.signal_history.clear()
+            self.performance_metrics = {
+                'total_signals': 0,
+                'successful_signals': 0,
+                'failed_signals': 0,
+                'win_rate': 0.0,
+                'avg_confidence': 0.0,
+                'market_performance': defaultdict(lambda: {'wins': 0, 'total': 0})
+            }
+            self.epsilon = 0.1
+            
+            self.logger.info("🤖 RL Model sıfırlandı")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Model sıfırlama hatası: {e}")

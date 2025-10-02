@@ -1,0 +1,279 @@
+"""
+SportMonks Advanced Client
+=========================
+
+SportMonks Advanced paketinin tüm canlı + historical + odds verilerini tek fonksiyonla sağlar.
+"""
+
+import aiohttp
+import asyncio
+from typing import Dict, List, Optional, Any
+import logging
+from datetime import datetime, timedelta
+
+
+class SportMonksClient:
+    """
+    SportMonks Advanced API Client
+    """
+    
+    def __init__(self, api_key: str, base_url: str = "https://api.sportmonks.com/v3/football"):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.session = None
+        self.logger = logging.getLogger("sm_client")
+        
+        # Rate limiting
+        self.requests_per_minute = 3000  # Advanced plan limit
+        self.request_timestamps = []
+    
+    async def _get_session(self):
+        """HTTP session'ı al veya oluştur"""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    
+    async def _make_request(self, endpoint: str, params: Dict = None) -> Dict:
+        """
+        API isteği yap
+        
+        Args:
+            endpoint: API endpoint'i
+            params: Query parametreleri
+            
+        Returns:
+            API yanıtı
+        """
+        # Rate limiting kontrolü
+        await self._check_rate_limit()
+        
+        session = await self._get_session()
+        
+        # Default parametreler
+        if params is None:
+            params = {}
+        
+        params['api_token'] = self.api_key
+        
+        url = f"{self.base_url}/{endpoint}"
+        
+        try:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data
+                else:
+                    self.logger.error(f"❌ SM API Hatası: {response.status} - {await response.text()}")
+                    return {}
+                    
+        except Exception as e:
+            self.logger.error(f"❌ SM API İstek hatası: {e}")
+            return {}
+    
+    async def _check_rate_limit(self):
+        """Rate limiting kontrolü"""
+        now = datetime.now()
+        
+        # Son 1 dakikadaki istekleri filtrele
+        self.request_timestamps = [
+            ts for ts in self.request_timestamps 
+            if now - ts < timedelta(minutes=1)
+        ]
+        
+        # Limit kontrolü
+        if len(self.request_timestamps) >= self.requests_per_minute:
+            sleep_time = 60 - (now - self.request_timestamps[0]).total_seconds()
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+        
+        self.request_timestamps.append(now)
+    
+    async def get_live_matches(self) -> List[Dict]:
+        """
+        Canlı maçları al
+        
+        Returns:
+            Canlı maç listesi
+        """
+        try:
+            # Advanced pakette tüm canlı veriler
+            params = {
+                'include': 'league,teams,scores,statistics,events,odds',
+                'filters': 'fixtureStates:1,6'  # Live states
+            }
+            
+            data = await self._make_request('fixtures', params)
+            
+            if 'data' in data:
+                matches = data['data']
+                self.logger.debug(f"📊 {len(matches)} canlı maç alındı")
+                return matches
+            
+            return []
+            
+        except Exception as e:
+            self.logger.error(f"❌ Canlı maç verisi alınamadı: {e}")
+            return []
+    
+    async def get_match_details(self, match_id: int) -> Optional[Dict]:
+        """
+        Detaylı maç verisi al
+        
+        Args:
+            match_id: Maç ID'si
+            
+        Returns:
+            Detaylı maç verisi
+        """
+        try:
+            # Advanced - tüm detaylar dahil
+            params = {
+                'include': 'league,teams,scores,statistics,events,lineups,odds,predictions,head2head'
+            }
+            
+            data = await self._make_request(f'fixtures/{match_id}', params)
+            
+            if 'data' in data:
+                match_data = data['data']
+                
+                # Ek işlemler - veriyi normalize et
+                processed_data = self._process_match_data(match_data)
+                
+                self.logger.debug(f"📊 Maç {match_id} detayları alındı")
+                return processed_data
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"❌ Maç {match_id} detayları alınamadı: {e}")
+            return None
+    
+    def _process_match_data(self, raw_data: Dict) -> Dict:
+        """
+        Ham maç verisini işle ve normalize et
+        
+        Args:
+            raw_data: SportMonks'tan gelen ham veri
+            
+        Returns:
+            İşlenmiş maç verisi
+        """
+        try:
+            # Temel maç bilgileri
+            processed = {
+                'id': raw_data.get('id'),
+                'league_id': raw_data.get('league_id'),
+                'home_team': raw_data.get('localteam', {}).get('data', {}),
+                'away_team': raw_data.get('visitorteam', {}).get('data', {}),
+                'scores': raw_data.get('scores', {}).get('data', []),
+                'time': {
+                    'status': raw_data.get('time', {}).get('status'),
+                    'minute': raw_data.get('time', {}).get('minute'),
+                    'added_time': raw_data.get('time', {}).get('added_time'),
+                    'extra_minute': raw_data.get('time', {}).get('extra_minute')
+                },
+                'statistics': self._process_statistics(raw_data.get('statistics', {}).get('data', [])),
+                'events': self._process_events(raw_data.get('events', {}).get('data', [])),
+                'odds': self._process_odds(raw_data.get('odds', {}).get('data', [])),
+                'predictions': raw_data.get('predictions', {}).get('data', {}),
+                'h2h': raw_data.get('head2head', {}).get('data', [])
+            }
+            
+            return processed
+            
+        except Exception as e:
+            self.logger.error(f"❌ Maç verisi işlenemedi: {e}")
+            return raw_data
+    
+    def _process_statistics(self, stats_data: List[Dict]) -> Dict:
+        """İstatistikleri işle"""
+        stats = {'home': {}, 'away': {}}
+        
+        for stat in stats_data:
+            team_type = 'home' if stat.get('team_id') == stat.get('fixture', {}).get('localteam_id') else 'away'
+            
+            stats[team_type] = {
+                'shots_total': stat.get('shots', {}).get('total'),
+                'shots_on_goal': stat.get('shots', {}).get('ongoal'),
+                'possession': stat.get('possessiontime'),
+                'corners': stat.get('corners'),
+                'fouls': stat.get('fouls'),
+                'cards_yellow': stat.get('yellowcards'),
+                'cards_red': stat.get('redcards'),
+                'attacks': stat.get('attacks'),
+                'dangerous_attacks': stat.get('dangerous_attacks')
+            }
+        
+        return stats
+    
+    def _process_events(self, events_data: List[Dict]) -> List[Dict]:
+        """Olayları işle"""
+        processed_events = []
+        
+        for event in events_data:
+            processed_events.append({
+                'id': event.get('id'),
+                'type': event.get('type'),
+                'minute': event.get('minute'),
+                'extra_minute': event.get('extra_minute'),
+                'team_id': event.get('team_id'),
+                'player_id': event.get('player_id'),
+                'player_name': event.get('player_name'),
+                'result': event.get('result'),
+                'reason': event.get('reason')
+            })
+        
+        return processed_events
+    
+    def _process_odds(self, odds_data: List[Dict]) -> Dict:
+        """Oranları işle"""
+        odds = {}
+        
+        for bookmaker in odds_data:
+            bookmaker_name = bookmaker.get('name', 'unknown')
+            odds[bookmaker_name] = {}
+            
+            for market in bookmaker.get('odds', {}).get('data', []):
+                market_name = market.get('label')
+                odds[bookmaker_name][market_name] = {
+                    'values': market.get('values', []),
+                    'suspended': market.get('suspended', False)
+                }
+        
+        return odds
+    
+    async def get_historical_data(self, team_id: int, days: int = 30) -> List[Dict]:
+        """
+        Takımın geçmiş maç verilerini al
+        
+        Args:
+            team_id: Takım ID'si
+            days: Kaç gün geriye gidilecek
+            
+        Returns:
+            Geçmiş maç listesi
+        """
+        try:
+            from_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            
+            params = {
+                'include': 'scores,statistics,events',
+                'team_id': team_id,
+                'from': from_date
+            }
+            
+            data = await self._make_request('fixtures', params)
+            
+            if 'data' in data:
+                return data['data']
+            
+            return []
+            
+        except Exception as e:
+            self.logger.error(f"❌ Takım {team_id} geçmiş verisi alınamadı: {e}")
+            return []
+    
+    async def close(self):
+        """Client'ı kapat"""
+        if self.session and not self.session.closed:
+            await self.session.close()

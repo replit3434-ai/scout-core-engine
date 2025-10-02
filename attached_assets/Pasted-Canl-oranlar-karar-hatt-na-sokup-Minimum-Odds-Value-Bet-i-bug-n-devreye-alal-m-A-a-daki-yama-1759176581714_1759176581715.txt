@@ -1,0 +1,251 @@
+Canlı oranları karar hattına sokup, “Minimum Odds + Value Bet”i bugün devreye alalım. Aşağıdaki yamalar kopyala–yapıştır çalışır; mevcut mimarine uyumlu, geri alınabilir ve null-safe.
+
+Hedef
+
+Minimum Odds filtresi (örn. <1.80 olanları ele)
+Value Bet tespiti (model_prob vs implied_prob)
+En iyi oran seçimi (bookmaker’lar arasından best_odds)
+Basit odds-momentum izleme (opsiyonel, skaffold)
+config.json ekleri
+Esnek pazar bazlı eşikler + bookmaker whitelist
+json
+Copy
+{
+  "odds": {
+    "min_odds_default": 1.80,
+    "min_odds_per_market": {
+      "over_2_5": 1.80,
+      "btts_yes": 1.70,
+      "next_goal": 2.10
+    },
+    "bookmaker_whitelist": ["Pinnacle", "Bet365", "Marathon"],
+    "value_margin": 0.10,        // model_prob > implied_prob * (1 + margin)
+    "movement_window_secs": 300, // trend için 5 dk pencere (opsiyonel)
+    "movement_min_change": 0.10  // 0.10 oran düşüş/yükseliş eşiği (opsiyonel)
+  }
+}
+services/odds_utils.py — best_odds seçici + implied hesap + min threshold
+python
+Copy
+# services/odds_utils.py
+from typing import Any, Dict, List, Optional, Tuple
+import time
+
+def select_best_odds(odds_payload: Any, market_key: str, bookmaker_whitelist: List[str]) -> Optional[Tuple[str, float]]:
+    """
+    odds_payload: SportMonks odds normalize edilmiş veri veya ham odds include
+    market_key: "over_2_5", "btts_yes", "next_goal" vb.
+    Döner: (bookmaker_name, best_odds) veya None
+    """
+    if not odds_payload:
+        return None
+    # Beklenen yapı esnek; en yaygını: {"data": [{bookmaker: {name}, "value": 2.05, "market":"over_2_5"}...]}
+    items = odds_payload.get("data") if isinstance(odds_payload, dict) else odds_payload
+    if not isinstance(items, list):
+        return None
+
+    best_name = None
+    best_val = 0.0
+    wl = set((bookmaker_whitelist or []))
+    for it in items:
+        mk = (it.get("market") or it.get("label") or "").lower()
+        if market_key not in mk:
+            continue
+        bk = (it.get("bookmaker") or {}).get("name") or it.get("bookmaker_name") or "Unknown"
+        if wl and bk not in wl:
+            continue
+        # Bazı feedlerde oran "price" veya "odd" alanında
+        val = it.get("value") or it.get("price") or it.get("odd")
+        try:
+            val = float(val)
+        except Exception:
+            continue
+        if val > best_val:
+            best_val = val
+            best_name = bk
+
+    return (best_name, best_val) if best_name and best_val > 0 else None
+
+def implied_prob_from_odds(odds: float) -> float:
+    return 0.0 if not odds or odds <= 1e-9 else 1.0 / odds
+
+# Basit odds hareketi takibi (opsiyonel)
+class OddsTrendCache:
+    def __init__(self, window_secs: int = 300):
+        self.window = window_secs
+        self.store: Dict[str, List[Tuple[float, float]]] = {}  # key -> [(ts, odds), ...]
+
+    def push(self, key: str, odds: float):
+        now = time.time()
+        arr = self.store.setdefault(key, [])
+        arr.append((now, odds))
+        cutoff = now - self.window
+        self.store[key] = [(ts, o) for (ts, o) in arr if ts >= cutoff]
+
+    def delta(self, key: str) -> Optional[float]:
+        arr = self.store.get(key) or []
+        if len(arr) < 2:
+            return None
+        # ilk ve son
+        return arr[-1][1] - arr[0][1]
+market_selector.py — Minimum Odds filtresi + best_odds entegrasyonu
+python
+Copy
+# market_selector.py
+import json
+from typing import List
+from utils.logger import get_logger
+from services.odds_utils import select_best_odds
+
+logger = get_logger("market_selector")
+
+def _cfg_min_odds(cfg: dict, market_key: str) -> float:
+    odds_cfg = cfg.get("odds", {}) if isinstance(cfg, dict) else {}
+    per = (odds_cfg.get("min_odds_per_market") or {})
+    if market_key in per:
+        return float(per[market_key])
+    return float(odds_cfg.get("min_odds_default", 1.80))
+
+def _bk_whitelist(cfg: dict) -> List[str]:
+    odds_cfg = cfg.get("odds", {}) if isinstance(cfg, dict) else {}
+    return list(odds_cfg.get("bookmaker_whitelist", []) or [])
+
+def enrich_with_best_odds(signal, odds_payload, cfg: dict):
+    # signal.market, signal.odds alanlarını doldur
+    wl = _bk_whitelist(cfg)
+    res = select_best_odds(odds_payload, market_key=signal.market, bookmaker_whitelist=wl)
+    if res:
+        bk, val = res
+        signal.odds = float(val)
+        signal.meta = signal.meta or {}
+        signal.meta["bookmaker"] = bk
+    else:
+        # odds bulunamadıysa mevcut davranışı koru ya da None bırak
+        if getattr(signal, "odds", None) is None:
+            signal.odds = None
+    return signal
+
+def apply_min_odds_filter(signal, cfg: dict) -> bool:
+    """
+    True -> sinyal geçer; False -> elenir
+    """
+    min_required = _cfg_min_odds(cfg, signal.market)
+    if signal.odds is None:
+        # Oran yoksa elensin mi? İlk fazda evet: düşük getiri riskini engelleriz.
+        logger.debug("No odds for %s, dropping (min=%.2f).", signal.id, min_required)
+        return False
+    if signal.odds < min_required:
+        logger.debug("Odds too low for %s: %.2f < %.2f", signal.id, signal.odds, min_required)
+        return False
+    return True
+Kullanım (mevcut akışın içinde):
+
+processOdds() çıktısını signal’a geçir ve min_odds filtresini uygula.
+python
+Copy
+# signal_generation.py veya market seçim hattında
+from services.odds_utils import implied_prob_from_odds
+from market_selector import enrich_with_best_odds, apply_min_odds_filter
+
+def build_signals_for_match(match, model_probs, odds_payload, cfg):
+    # model_probs: dict {market_key: prob_float}
+    out = []
+    for market_key, model_prob in model_probs.items():
+        sig = Signal(
+            id=f"{match['match_id']}:{market_key}",
+            match_id=str(match["match_id"]),
+            market=market_key,
+            home=match["home_team"],
+            away=match["away_team"],
+            confidence=model_prob,  # 0..1
+            minute=match["minute"],
+            ttl_seconds=cfg.get("signal_ttl", 15) * 60,
+            state="PRE",
+            meta={}
+        )
+        # 1) odds enrich (best among bookmakers)
+        sig = enrich_with_best_odds(sig, odds_payload, cfg)
+
+        # 2) minimum odds filter
+        if not apply_min_odds_filter(sig, cfg):
+            continue
+
+        # 3) value bet tespiti (RL tarafı ayrıntıda, burada işaretleyelim)
+        if sig.odds:
+            implied = implied_prob_from_odds(sig.odds)
+            margin = float(cfg.get("odds", {}).get("value_margin", 0.10))
+            if sig.confidence > implied * (1.0 + margin):
+                sig.meta["value_bet"] = True
+                sig.meta["value_score"] = round(sig.confidence - implied, 4)
+        out.append(sig)
+    return out
+rl_agent.py — calculateValueOddsRatio kullanımıyla Value bet kararı
+Sende fonksiyon zaten var. Sinyal meta’sını besleyecek kısa ek:
+python
+Copy
+# rl_agent.py
+from services.odds_utils import implied_prob_from_odds
+
+def annotate_value_on_signal(signal, value_margin: float = 0.10):
+    if not signal.odds or not (0.0 < signal.confidence <= 1.0):
+        return signal
+    implied = implied_prob_from_odds(signal.odds)
+    # calculateValueOddsRatio() zaten varsa onun çıktısını da set edebilirsin
+    value_ok = signal.confidence > implied * (1.0 + value_margin)
+    signal.meta = signal.meta or {}
+    signal.meta["implied_prob"] = round(implied, 4)
+    signal.meta["value_ok"] = bool(value_ok)
+    signal.meta["value_margin"] = value_margin
+    return signal
+Active Signal Service — odds alanlarını API’ye ekle (UI için)
+api/server snapshot’a odds ve bookmaker ekle:
+python
+Copy
+# api/server.py (snapshot)
+def _ui_signal(s):
+    return {
+        "id": s.id,
+        "match_id": s.match_id,
+        "market": s.market,
+        "home": s.home,
+        "away": s.away,
+        "confidence": float(s.confidence) if s.confidence is not None else None,
+        "minute": int(s.minute) if s.minute is not None else None,
+        "ttl_left": int(s.time_left()),
+        "state": s.state,
+        "odds": getattr(s, "odds", None),
+        "bookmaker": (s.meta or {}).get("bookmaker"),
+        "value_bet": (s.meta or {}).get("value_bet") or (s.meta or {}).get("value_ok"),
+        "value_score": (s.meta or {}).get("value_score"),
+    }
+(Opsiyonel) Odds hareketi takibi
+build_signals_for_match içinde trend cache’e push edip delta’ya göre metrik ekle:
+python
+Copy
+from services.odds_utils import OddsTrendCache
+_odds_trend = OddsTrendCache(window_secs=int(cfg.get("odds", {}).get("movement_window_secs", 300)))
+
+# enrich sonrası:
+if sig.odds:
+    _odds_trend.push(sig.id, sig.odds)
+    delta = _odds_trend.delta(sig.id)
+    if delta is not None:
+        sig.meta["odds_delta"] = round(delta, 2)
+        # istersen delta < -movement_min_change ise risk azalt, threshold yükselt vb.
+Frontend küçük ek
+SignalCard’da odds ve value etiketi göster:
+Odds yoksa kart çıkmayacak zaten (min_odds filtresi) ama null-safe render önerilir.
+Fayda beklenen etkiler
+
+Minimum Odds: düşük getirili sinyalleri keser → net ROI artışı
+Value Bet: modelin “piyasa yanlış fiyatlamış” dediği fırsatları öne çıkarır
+Best odds: aynı sinyalde daha iyi getiri
+Trend (opsiyonel): riskli düşüşlerde sinyali sıkılaştırma imkanı
+Hızlı uygulama sırası
+
+config.json’a odds bloğunu ekle
+services/odds_utils.py ekle
+market_selector.py içindeki enrich_with_best_odds + apply_min_odds_filter’i çağır
+signal generation hattında implied/value işaretle
+api snapshot’a odds alanlarını dahil et
+Deploy ve log: “Odds too low”, “value_bet=True” satırlarını gör

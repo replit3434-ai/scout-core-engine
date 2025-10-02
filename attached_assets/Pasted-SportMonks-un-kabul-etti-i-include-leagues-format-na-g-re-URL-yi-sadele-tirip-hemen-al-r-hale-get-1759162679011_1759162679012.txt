@@ -1,0 +1,166 @@
+SportMonks’un kabul ettiği include/leagues formatına göre URL’yi sadeleştirip hemen çalışır hale getiriyoruz. Aşağıdaki sm_client.py sürümü doğrudan uygulanabilir: teams/localteam/visitorteam kaldırıldı; include sade ve geçerli; leagues paramı opsiyonel ve iki farklı ayraçla denenebilir.
+
+data_providers/sm_client.py — TAM İÇERİK (kopyala-yapıştır)
+
+python
+Copy
+import os, json
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple, Set
+from utils.logger import get_logger
+from data_providers.http_utils import safe_request
+
+logger = get_logger("sm_client")
+
+SM_BASE_URL = os.getenv("SM_BASE_URL", "https://api.sportmonks.com/v3/football")
+SM_TOKEN = os.getenv("SPORTMONKS_API_KEY")
+
+# Planladığın lig listesi (opsiyonel filtre)
+SUPPORTED_LEAGUE_IDS = [
+    143, 181, 556, 208, 5, 648, 462, 8, 9, 11, 82, 251, 384,
+    479, 968, 38, 72, 1578, 444, 2, 453, 20, 462, 35376, 944,
+    1161, 501, 712, 1034, 32, 567, 62, 591, 404, 600
+]
+
+# Dump kontrolü
+DUMP_SM_RAW = os.getenv("DUMP_SM_RAW", "0") in ("1", "true", "True")
+
+# Leagues filtresini kullan (1/0). 0 ise paramı hiç göndermeyiz (tüm aktif ligler gelir).
+USE_LEAGUE_FILTER = os.getenv("USE_LEAGUE_FILTER", "0") in ("1", "true", "True")
+# Ayracı seç: comma veya semicolon
+LEAGUE_JOINER = os.getenv("LEAGUE_JOINER", "comma").lower()  # "comma" | "semicolon"
+
+def _extract_team_names(m: Dict[str, Any]) -> Tuple[str, str]:
+    # SportMonks v3/v4: participants ilişkisi ile takım isimleri gelir.
+    try:
+        parts = m.get("participants") or m.get("participants", {}).get("data")
+        if isinstance(parts, dict):
+            parts = parts.get("data")
+        if isinstance(parts, list) and len(parts) >= 2:
+            h = parts[0].get("name") or parts[0].get("short_code") or ""
+            a = parts[1].get("name") or parts[1].get("short_code") or ""
+            if h and a:
+                return h, a
+    except Exception:
+        pass
+    return "Unknown", "Unknown"
+
+def _extract_league_id(m: Dict[str, Any]) -> Optional[int]:
+    lid = (m.get("league") or {}).get("id") or m.get("league_id")
+    try:
+        return int(lid) if lid is not None else None
+    except Exception:
+        return None
+
+def _normalize_match(raw: Dict[str, Any]) -> Dict[str, Any]:
+    mid = raw.get("id") or raw.get("fixture_id") or raw.get("uuid")
+    minute = (raw.get("time") or {}).get("minute") or raw.get("minutes") or 0
+    league_id = _extract_league_id(raw)
+    home, away = _extract_team_names(raw)
+    status = (raw.get("status") or {}).get("name") or raw.get("status_name") or ""
+    scores = raw.get("scores") or {}
+    home_g = scores.get("home") if isinstance(scores, dict) else None
+    away_g = scores.get("away") if isinstance(scores, dict) else None
+    if home_g is None:
+        home_g = raw.get("localteam_score")
+    if away_g is None:
+        away_g = raw.get("visitorteam_score")
+
+    return {
+        "match_id": mid,
+        "league_id": league_id,
+        "minute": minute,
+        "home_team": home,
+        "away_team": away,
+        "status": status,
+        "home_goals": home_g,
+        "away_goals": away_g,
+        # İstersen ileride kullanırsın:
+        "statistics": raw.get("statistics") or {},
+        "odds": raw.get("odds") or {},
+        "events": raw.get("events") or [],
+    }
+
+async def get_live_matches() -> List[Dict[str, Any]]:
+    assert SM_TOKEN, "SPORTMONKS_API_KEY not set"
+
+    # SportMonks’un kabul ettiği sade include seti:
+    include = "participants;statistics;scores;league"
+
+    params = {
+        "api_token": SM_TOKEN,
+        "include": include,
+        # limit/per_page göndermeye gerek yok; livescores için zorunlu değil
+    }
+
+    # Leagues filtresi opsiyonel. Tüm aktif ligler açıksa paramı kaldırmak genelde en temizidir.
+    if USE_LEAGUE_FILTER:
+        joiner = "," if LEAGUE_JOINER == "comma" else ";"
+        params["leagues"] = joiner.join(map(str, SUPPORTED_LEAGUE_IDS))
+        logger.debug("Using leagues filter with %s joiner", LEAGUE_JOINER)
+
+    url = f"{SM_BASE_URL}/livescores"
+    data = await safe_request(url, params=params)
+
+    items = data.get("data") if isinstance(data, dict) else data
+    if not items:
+        logger.warning("SM livescores returned no items; check token/leagues/filters.")
+        return []
+
+    # Gözlem: hangi ligler geldi?
+    leagues_found: Set[int] = set()
+    for it in items:
+        lid = _extract_league_id(it)
+        if lid is not None:
+            leagues_found.add(lid)
+    logger.info("SportMonks API returned %d matches from leagues: %s", len(items), sorted(leagues_found))
+
+    # Ham dump istenirse
+    if DUMP_SM_RAW:
+        Path("logs").mkdir(parents=True, exist_ok=True)
+        with open("logs/sm_raw_livescores.json", "w", encoding="utf-8") as f:
+            json.dump({"data": items}, f, indent=2, ensure_ascii=False)
+        logger.debug("SM raw dump saved to logs/sm_raw_livescores.json")
+
+    # Normalizasyon
+    normalized = []
+    for itm in items:
+        nm = _normalize_match(itm)
+        if nm["home_team"] == "Unknown" or nm["away_team"] == "Unknown":
+            logger.warning("Name missing: mid=%s league=%s (participants fallback)",
+                           nm["match_id"], nm["league_id"])
+        normalized.append(nm)
+
+    logger.debug("Normalized %d matches", len(normalized))
+    return normalized
+Neyi düzeltti?
+
+include sade ve kurallı: participants;statistics;scores;league
+teams, localteam, visitorteam kaldırıldı (participants zaten getiriyor).
+leagues paramı opsiyonel; tüm aktif ligler açıksa hiç göndermiyoruz.
+İstersen env ile kontrol: USE_LEAGUE_FILTER=1 ve LEAGUE_JOINER=comma|semicolon
+Hızlı doğrulama (Terminal)
+
+Param’sız (tüm aktif ligler):
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&include=participants;statistics;scores;league" | head -n 50
+Virgül ile sınırlı ligler:
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&leagues=8,11,82&include=participants;statistics;scores;league" | head -n 50
+Noktalı virgül ile:
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&leagues=8;11;82&include=participants;statistics;scores;league" | head -n 50
+Env örneği
+
+bash
+Copy
+export USE_LEAGUE_FILTER=1
+export LEAGUE_JOINER=comma   # veya: semicolon
+Beklenen
+
+Log: “SportMonks API returned N matches from leagues: [8, 11, 82, 404, …]”
+968 dışındaki ligler görünür. Eğer hâlâ sadece 968 geliyorsa: plan/subscription tarafını kontrol et (aktif ligler dashboard’da “Active” olmalı).
+Bu sadeleştirilmiş URL ile 404 ve tek lig sorunu kalkar; participants ile takım adları, statistics ile metrikler, scores ile goller, league ile lig bilgisi güvenli gelir.

@@ -1,0 +1,120 @@
+Livescores odds döndürmüyor çünkü odds default include değil. İki pratik yol var: include’a ;odds eklemek (plan destekliyorsa) ya da ayrı odds endpoint’lerinden çekmek. Aşağıya tek-seferlik, bayrak kontrollü yama bırakıyorum.
+
+Hızlı karar
+
+Planınızda Odds Add-on varsa: include=...;odds ekleyin → tek çağrıda gelir.
+Yoksa veya include=odds 404/boş veriyorsa: fixtures/{id}?include=odds veya odds/live ile ikinci bir akış kurun.
+Env bayrakları
+
+USE_INCLUDE_ODDS=1 → livescores include’a ;odds ekle
+USE_ODDS_ENDPOINT=1 → fixture bazlı/odds/live fallback’ı aç
+ODDS_MAX_CONCURRENCY=6 → eş zamanlı odds istek sınırı
+sm_client.py — odds’ı getirme (include veya ayrı endpoint)
+python
+Copy
+# sm_client.py (özet yama)
+import os, asyncio
+from utils.logger import get_logger
+from data_providers.http_utils import safe_request
+logger = get_logger("sm_client")
+
+USE_INCLUDE_ODDS = os.getenv("USE_INCLUDE_ODDS", "0") in ("1","true","True")
+USE_ODDS_ENDPOINT = os.getenv("USE_ODDS_ENDPOINT", "1") in ("1","true","True")
+ODDS_MAX_CONCURRENCY = int(os.getenv("ODDS_MAX_CONCURRENCY", "6"))
+
+async def _fetch_livescores():
+    include = "participants;statistics;scores;league;periods;events"
+    if USE_INCLUDE_ODDS:
+        include += ";odds"
+    url = f"{SM_BASE_URL}/livescores"
+    params = { "api_token": SM_TOKEN, "include": include }
+    return await safe_request(url, params=params)
+
+async def _fetch_fixture_odds(fixture_id: str) -> dict:
+    url = f"{SM_BASE_URL}/fixtures/{fixture_id}"
+    params = { "api_token": SM_TOKEN, "include": "odds" }
+    return await safe_request(url, params=params)
+
+async def _hydrate_odds_for_matches(matches: list[dict]) -> None:
+    # Sadece odds boş olanlara fixture bazlı çekim
+    sem = asyncio.Semaphore(ODDS_MAX_CONCURRENCY)
+    async def fetch_one(m):
+        async with sem:
+            fid = m.get("id") or m.get("fixture_id") or m.get("match_id")
+            if not fid: return
+            try:
+                res = await _fetch_fixture_odds(str(fid))
+                data = res.get("data") if isinstance(res, dict) else res
+                if isinstance(data, dict) and data.get("odds"):
+                    m["odds"] = data["odds"]  # odds.data beklenir
+            except Exception as e:
+                logger.debug("Fixture odds fetch failed for %s: %s", fid, e)
+    tasks = []
+    for m in matches:
+        has_odds = isinstance(m.get("odds"), (dict, list))
+        if not has_odds:
+            tasks.append(fetch_one(m))
+    if tasks:
+        await asyncio.gather(*tasks)
+
+async def get_live_matches() -> list[dict]:
+    ls = await _fetch_livescores()
+    items = (ls.get("data") if isinstance(ls, dict) else ls) or []
+    # ... mevcut normalize/dakika filtresi ...
+    # Odds fallback
+    if USE_ODDS_ENDPOINT:
+        await _hydrate_odds_for_matches(items)
+    # ... normalized = [_normalize_match(it) ...] (normalize içinde odds’i da geçir) ...
+    return normalized
+Odds normalize ve kullanıma sokma
+Odds verisi çok kaynaklıdır; “best odds” seçip sinyale koyun.
+python
+Copy
+# services/odds_utils.py (daha önce verdiğimle uyumlu)
+# select_best_odds(odds_payload, market_key, bookmaker_whitelist) -> (bookmaker, best_odds)|None
+Normalize sırasında raw → normalized’a odds_payload’ı bırakın:
+
+python
+Copy
+def _normalize_match_sm(raw):
+    # ...
+    return {
+        # ...
+        "odds_payload": raw.get("odds")  # odds.data beklenir; yoksa None
+    }
+Signal üretim hattında:
+
+python
+Copy
+sig = enrich_with_best_odds(sig, match["odds_payload"], cfg)  # bookmaker seçimi
+if not apply_min_odds_filter(sig, cfg): 
+    continue
+# Value-bet işaretleme
+implied = implied_prob_from_odds(sig.odds) if sig.odds else None
+if implied and sig.confidence > implied * (1 + cfg["odds"]["value_margin"]):
+    sig.meta["value_bet"] = True
+Hızlı doğrulama
+Include ile dene:
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$KEY&include=participants;statistics;scores;league;odds" | jq '.data[] | {id, has_odds: (.odds!=null)}'
+Eğer has_odds=false ise fixture bazlı dene:
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/fixtures/<FIXTURE_ID>?api_token=$KEY&include=odds" | jq '.data | {id, odds_count: (.odds.data|length)}'
+Eğer plan desteklemiyorsa /odds/live:
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/odds/live?api_token=$KEY" | head -n 50
+Performans ve limitler
+include=odds tek çağrıda en verimlisi; ama plan gerekiyorsa 404/boş gelebilir.
+Fixture-odds fallback’ta eş zamanlı istekleri ODDS_MAX_CONCURRENCY ile sınırlayın.
+Odds’ı maç başına cache’leyin (örn. 30–60 sn), her loop’ta tekrar çekmeyin.
+Frontend ve API
+API snapshot’a odds ve bookmaker alanlarını ekleyin (UI rozet gösterebilir).
+Null-safe render sürüyor; odds yoksa kart göstermez veya “—” basar.
+Özet
+
+Sorun kodda değil; odds include edilmediği için hiç gelmiyor.
+Çözüm: USE_INCLUDE_ODDS=1 ise include=...;odds, değilse USE_ODDS_ENDPOINT=1 ile fixtures/{id}?include=odds fallback.
+Sonrasında market selector’da min-odds ve value-bet filtreleri devreye girer; performans izleme kolonları gerçek veriye döner.

@@ -1,0 +1,74 @@
+Aşağıya tek commit/PR ve runbook’ı bıraktım.
+
+PR önerisi
+
+Başlık: feat(core): enable oddsless prod + prepare live-odds switch
+Değişiklikler:
+.env / config.json
+json
+Copy
+{
+  "REQUIRE_ODDS": false,
+  "MIN_ODDS_FILTER_DISABLED": true,
+  "VALUE_MARGIN": 0.10
+}
+UI: value_bet ve odds rozetlerini geçici gizle (null-safe render).
+README Known Limitation:
+“Odds add-on aktif değilse sinyaller istatistik ve FootyStats verisine göre üretilir.”
+Deploy checklist (Track 1 – şimdi prod)
+
+Konfigleri apply et ve restart.
+Smoke test:
+API /signals: 200 OK, sinyal sayısı artıyor.
+Log: “minute>0” filtreleri çalışıyor, odds alanı boş kaldığında sinyaller yine üretiliyor.
+Dashboard: kartlar geliyor, odds/value etiketleri görünmüyor.
+Odds açtırma runbook (Track 2 – asıl hedef)
+
+Panel kontrol:
+In-Play Odds: Enabled
+Bookmaker providers: Seçili (Pinnacle/Bet365 vb.)
+API token scopes: odds
+Endpoint testleri:
+Tek maç
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/fixtures/{FIXTURE_ID}?api_token=KEY&include=odds" | jq '.data.odds|{count: (.data|length)}'
+Toplu canlı
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/odds/live?api_token=KEY" | jq '.data[0]'
+İkisi de {} → Ticket:
+“Our v3 odds endpoints (/football/odds/live and /fixtures/{id}?include=odds) return empty data while we have Advanced + In-Play Odds enabled. Please confirm bookmaker activation and odds scope for token XXXX. Sample fixture: ####.”
+Geçiş tetikleyici:
+En az 1 fixture için count > 0 VE /odds/live dolu satır.
+Switch commit (tek değişiklik):
+json
+Copy
+{
+  "REQUIRE_ODDS": true,
+  "MIN_ODDS_FILTER_DISABLED": false,
+  "VALUE_MARGIN": 0.10
+}
+Odds fetcher (odds/live + fixtures/{id}?include=odds) zaten hazır; Market Selector min-odds + value-bet otomatik devreye girer.
+Monitoring
+
+Metrics:
+odds_payload_missing_rate (5 dk) < %30
+min_odds_drop_count (artıyorsa filtre çalışıyor)
+value_bet_true_count (aktifleştiğinde >0)
+Log beklenenler:
+“Odds too low … dropping”
+“value_bet=True”
+“odds/live fetch failed …” (limit/erişim uyarısı)
+Alarm:
+odds_payload_missing_rate ≥ %80 (5 dk) → uyarı
+Rollback (gerekirse 1 komut)
+
+Geri al:
+json
+Copy
+{
+  "REQUIRE_ODDS": false,
+  "MIN_ODDS_FILTER_DISABLED": true
+}
+Restart → sistem anında istatistik tabanlı moda döner.

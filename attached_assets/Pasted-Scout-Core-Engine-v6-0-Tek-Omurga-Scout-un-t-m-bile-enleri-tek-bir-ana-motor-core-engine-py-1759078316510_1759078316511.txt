@@ -1,0 +1,314 @@
+Scout Core Engine v6.0 - Tek Omurga 🚀
+
+Scout'un tüm bileşenleri tek bir ana motor (core_engine.py) üzerinden çalışan, modüler ve ölçeklenebilir futbol bahis sinyal sistemi.
+
+🎯 Mimari Özeti
+scout_core/
+│
+├── core_engine.py          # TEK OMURGA (ana loop)
+│
+├── data_providers/
+│   ├── sm_client.py        # SportMonks Advanced tüm canlı + historical + odds verisi
+│   ├── fs_client.py        # FootyStats pre-match & trend verileri
+│
+├── decision_engines/
+│   ├── market_selector.py  # Hangi marketlerde sinyal üretileceğini belirler
+│   ├── rl_agent.py         # RL tabanlı final sinyal kararı
+│
+└── utils/
+    ├── config.py           # Konfigürasyon yönetimi
+    ├── logger.py           # Logging sistemi
+    ├── backtest_tools.py   # Backtesting araçları
+
+✅ Akış Mantığı
+1. Veri Katmanı
+
+SportMonks Client: Advanced paketin tüm canlı veri (event, stats, odds) ve historical datasını tek fonksiyonla verir
+
+FootyStats Client: Over/Under potansiyelleri, BTTS trendleri gibi hızlı pre-match istatistikleri verir
+
+2. Karar Katmanı
+
+Market Selector: SM + FS verilerini birleştirerek hangi marketlerde (Over/Under, BTTS, Next Goal vb.) aday sinyaller oluşacağını çıkarır
+
+RL Agent: Bu aday sinyalleri geçmiş performans ve ödül/ceza mantığı ile değerlendirir, final sinyali üretir
+
+3. Core Engine (Tek Omurga)
+
+Tüm veri sağlayıcıları çağırır, karar modüllerini sırasıyla çalıştırır
+
+Sadece tek sinyal listesi döner: canlı Scout'un dashboard ve API'si bu çıktıyı kullanır
+
+🚀 Kurulum
+1. Gereksinimler
+pip install aiohttp asyncio numpy pandas psutil
+
+2. Konfigürasyon
+# config.json dosyasını düzenleyin
+{
+    "sportmonks_api_key": "YOUR_SPORTMONKS_API_KEY",
+    "footystats_api_key": "YOUR_FOOTYSTATS_API_KEY",
+    "update_interval": 30,
+    "signal_ttl": 15,
+    "supported_leagues": [8, 82, 564, 301, 384]
+}
+
+3. Çalıştırma
+python core_engine.py
+
+📊 Desteklenen Marketler
+Over/Under
+
+Over/Under 1.5, 2.5, 3.5
+
+Canlı maç istatistikleri bazlı analiz
+
+Minimum güven: %65
+
+BTTS (Both Teams To Score)
+
+Yes/No seçenekleri
+
+Takım form analizi
+
+Minimum güven: %60
+
+Next Goal
+
+Home/Away/No Goal
+
+Momentum analizi
+
+Minimum güven: %70
+
+Corners
+
+Total Corners Over/Under
+
+Takım corner istatistikleri
+
+Minimum güven: %55
+
+Cards
+
+Total Cards Over/Under
+
+Agresiflik analizi
+
+Minimum güven: %50
+
+🤖 RL Agent Özellikleri
+Öğrenme Sistemi
+
+Q-Learning tabanlı karar verme
+
+Experience replay buffer
+
+Epsilon-greedy exploration
+
+Performance Tracking
+
+Market bazlı başarı oranları
+
+Confidence seviyesi analizi
+
+Gerçek zamanlı model güncelleme
+
+Adaptif Sistem
+
+Başarısız sinyallerden öğrenme
+
+Market performansına göre ağırlık ayarlama
+
+Otomatik model kaydetme/yükleme
+
+📈 Backtesting
+Kullanım
+from utils.backtest_tools import BacktestEngine
+
+# Backtest motoru oluştur
+backtest = BacktestEngine(config)
+
+# Backtest çalıştır
+result = backtest.run_backtest(signals_data, results_data)
+
+# Rapor oluştur
+report = backtest.generate_report(result)
+print(report)
+
+Metrikler
+
+Win Rate (Başarı Oranı)
+
+Total Profit (Toplam Kar)
+
+Sharpe Ratio
+
+Maximum Drawdown
+
+Market bazlı performans
+
+Confidence analizi
+
+🔧 API Kullanımı
+Engine Başlatma
+import asyncio
+from core_engine import ScoutEngineManager
+
+async def main():
+    async with ScoutEngineManager() as engine:
+        # Engine'i başlat
+        await engine.start_engine()
+
+asyncio.run(main())
+
+Aktif Sinyalleri Alma
+# Aktif sinyalleri al
+signals = engine.get_active_signals()
+
+# Engine durumunu kontrol et
+status = engine.get_engine_status()
+
+Manuel Sinyal Üretimi
+# Belirli bir maç için sinyal üret
+signals = await engine.manual_signal_generation(match_id=12345)
+
+📝 Logging
+Log Seviyeleri
+
+DEBUG: Detaylı debug bilgileri
+
+INFO: Genel bilgi mesajları
+
+WARNING: Uyarı mesajları
+
+ERROR: Hata mesajları
+
+CRITICAL: Kritik hatalar
+
+Log Dosyaları
+
+scout_core.log: Ana log dosyası
+
+logs/sm_client.log: SportMonks client logları
+
+logs/fs_client.log: FootyStats client logları
+
+logs/market_selector.log: Market selector logları
+
+logs/rl_agent.log: RL agent logları
+
+⚙️ Konfigürasyon Seçenekleri
+Engine Ayarları
+{
+    "update_interval": 30,        // Güncelleme aralığı (saniye)
+    "signal_ttl": 15,            // Sinyal yaşam süresi (dakika)
+    "max_concurrent_matches": 20 // Maksimum eşzamanlı maç
+}
+
+Market Ayarları
+{
+    "over_under": {
+        "enabled": true,
+        "min_confidence": 0.65,
+        "max_signals_per_match": 2
+    }
+}
+
+RL Ayarları
+{
+    "rl_settings": {
+        "learning_rate": 0.01,
+        "epsilon": 0.1,
+        "experience_buffer_size": 10000
+    }
+}
+
+🔍 Monitoring
+Performance Metrikleri
+
+Request/Response süreleri
+
+API başarı oranları
+
+Memory/CPU kullanımı
+
+Sinyal üretim hızı
+
+Error Tracking
+
+API hataları
+
+Veri kalitesi sorunları
+
+Model performans düşüşü
+
+System resource sorunları
+
+🛠️ Geliştirme
+Yeni Veri Sağlayıcısı Ekleme
+
+data_providers/ altında yeni client oluştur
+
+core_engine.py'da client'ı import et ve initialize et
+
+_main_loop() fonksiyonunda veri çekme işlemini ekle
+
+Yeni Market Ekleme
+
+market_selector.py'da yeni analiz fonksiyonu ekle
+
+config.py'da market ayarlarını tanımla
+
+backtest_tools.py'da evaluation logic'i ekle
+
+Yeni Karar Motoru Ekleme
+
+decision_engines/ altında yeni motor oluştur
+
+core_engine.py'da motor'u initialize et
+
+_process_match() fonksiyonunda motor'u çağır
+
+📚 Dokümantasyon
+API Referansı
+
+SportMonks API Docs
+
+FootyStats API Docs
+
+Algoritma Detayları
+
+Market Selection Logic
+
+RL Agent Implementation
+
+Backtesting Methodology
+
+🤝 Katkıda Bulunma
+
+Fork yapın
+
+Feature branch oluşturun (git checkout -b feature/amazing-feature)
+
+Commit yapın (git commit -m 'Add amazing feature')
+
+Push yapın (git push origin feature/amazing-feature)
+
+Pull Request oluşturun
+
+📄 Lisans
+
+Bu proje MIT lisansı altında lisanslanmıştır.
+
+🆘 Destek
+
+Sorularınız için:
+
+GitHub Issues
+
+Email: support@scout-core.com
+
+Discord: Scout Community
+
+Scout Core Engine v6.0 - Tek omurga, maksimum performans! 🚀

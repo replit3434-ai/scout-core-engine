@@ -1,0 +1,235 @@
+“Sadece 968 (J-League) geliyor” sorununu hem hızlı teşhis hem de otomatik düzeltme için tek adımlık “akıllı leagues param fallback” yamasını veriyorum. Bu yama:
+
+leagues parametresi için 3 varyasyonu otomatik dener:
+virgül ile (8,11,251,…)
+noktalı virgül ile (8;11;251;…)
+tamamen kaldır (servis tüm aktif ligleri dönsün)
+Dönen maçlardan gerçek league_id setini çıkarır ve loglar.
+Eğer hâlâ tek lig (ör. {968}) geliyorsa, plan/authorization kısıtı olduğunu net şekilde uyarır.
+include alanını geniş tutar: participants;teams;localteam;visitorteam;statistics;scores
+Ayrıca pagination’ı da destekliyor (per_page, page) – bazı hesaplarda gerekli olabiliyor.
+
+Uygulama: Aşağıdaki sm_client.py’yi kopyala-yapıştır et.
+
+data_providers/sm_client.py – TAM İÇERİK (kopyala-yapıştır)
+
+python
+Copy
+import os, json
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple, Set
+from utils.logger import get_logger
+from data_providers.http_utils import safe_request
+
+logger = get_logger("sm_client")
+
+SM_BASE_URL = os.getenv("SM_BASE_URL", "https://api.sportmonks.com/v3/football")
+SM_TOKEN = os.getenv("SPORTMONKS_API_KEY")
+
+# Senin hedeflediğin lig listesi (planına göre)
+SUPPORTED_LEAGUE_IDS = [
+    143, 181, 556, 208, 5, 648, 462, 8, 9, 11, 82, 251, 384,
+    479, 968, 38, 72, 1578, 444, 2, 453, 20, 462, 35376, 944,
+    1161, 501, 712, 1034, 32, 567, 62, 591, 404, 600
+]
+
+DUMP_SM_RAW = os.getenv("DUMP_SM_RAW", "0") in ("1","true","True")
+
+def _extract_team_names(m: Dict[str, Any]) -> Tuple[str, str]:
+    # 1) participants
+    try:
+        parts = m.get("participants") or m.get("participants", {}).get("data")
+        if isinstance(parts, dict):
+            parts = parts.get("data")
+        if isinstance(parts, list) and len(parts) >= 2:
+            h = parts[0].get("name") or parts[0].get("short_code") or ""
+            a = parts[1].get("name") or parts[1].get("short_code") or ""
+            if h and a:
+                return h, a
+    except Exception:
+        pass
+    # 2) localteam/visitorteam
+    try:
+        lt = (((m.get("localteam") or {}).get("data")) or {}).get("name")
+        vt = (((m.get("visitorteam") or {}).get("data")) or {}).get("name")
+        if lt and vt:
+            return lt, vt
+    except Exception:
+        pass
+    # 3) teams
+    try:
+        teams = m.get("teams") or m.get("teams", {}).get("data")
+        if isinstance(teams, list) and len(teams) >= 2:
+            h = teams[0].get("name") or ""
+            a = teams[1].get("name") or ""
+            if h and a:
+                return h, a
+    except Exception:
+        pass
+    return "Unknown", "Unknown"
+
+def _extract_league_id(m: Dict[str, Any]) -> Optional[int]:
+    lid = (m.get("league") or {}).get("id") or m.get("league_id")
+    try:
+        return int(lid) if lid is not None else None
+    except Exception:
+        return None
+
+def _normalize_match(raw: Dict[str, Any]) -> Dict[str, Any]:
+    mid = raw.get("id") or raw.get("fixture_id") or raw.get("uuid")
+    minute = (raw.get("time") or {}).get("minute") or raw.get("minutes") or 0
+    league_id = _extract_league_id(raw)
+    home, away = _extract_team_names(raw)
+    stats = raw.get("statistics") or {}
+    odds = raw.get("odds") or {}
+    events = raw.get("events") or []
+    status = (raw.get("status") or {}).get("name") or raw.get("status_name") or ""
+    scores = raw.get("scores") or {}
+    home_g = scores.get("home") if isinstance(scores, dict) else None
+    away_g = scores.get("away") if isinstance(scores, dict) else None
+    if home_g is None:
+        home_g = raw.get("localteam_score")
+    if away_g is None:
+        away_g = raw.get("visitorteam_score")
+
+    return {
+        "match_id": mid,
+        "league_id": league_id,
+        "minute": minute,
+        "home_team": home,
+        "away_team": away,
+        "stats": stats,
+        "odds": odds,
+        "events": events,
+        "status": status,
+        "home_goals": home_g,
+        "away_goals": away_g,
+    }
+
+async def _fetch_livescores_page(include: str, leagues_param: Optional[str], page: int, per_page: int = 100) -> Dict[str, Any]:
+    """
+    Tek sayfa çeker. leagues_param None ise göndermeyiz.
+    """
+    assert SM_TOKEN, "SPORTMONKS_API_KEY not set"
+    url = f"{SM_BASE_URL}/livescores"
+    params = {
+        "api_token": SM_TOKEN,
+        "include": include,
+        "per_page": per_page,
+        "page": page,
+    }
+    if leagues_param:
+        params["leagues"] = leagues_param
+    data = await safe_request(url, params=params)
+    return data if isinstance(data, dict) else {"data": data}
+
+async def _fetch_variant(include: str, leagues_joined: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    leagues_joined virgül/noktalı virgül join edilmiş string olabilir veya None (param yok).
+    Tüm sayfaları dolaşır ve birleştirir.
+    """
+    page = 1
+    all_items: List[Dict[str, Any]] = []
+    while True:
+        payload = await _fetch_livescores_page(include, leagues_joined, page)
+        items = payload.get("data") or []
+        if not items:
+            break
+        all_items.extend(items)
+        # SportMonks genelde next-page bilgisini meta içinde verir; yoksa boş dönene kadar devam ediyoruz.
+        page += 1
+        # Güvenlik: 10 sayfa sınırı
+        if page > 10:
+            logger.warning("Pagination limit reached (10 pages).")
+            break
+    return all_items
+
+async def get_live_matches() -> List[Dict[str, Any]]:
+    """
+    Leagues param için akıllı fallback:
+    1) ',' ile join
+    2) ';' ile join
+    3) leagues param yok
+    En geniş include seti ile dener, dönen ligleri loglar.
+    """
+    include = "participants;teams;localteam;visitorteam;statistics;scores"
+
+    # 1) virgül
+    leagues_comma = ",".join(map(str, SUPPORTED_LEAGUE_IDS))
+    items = await _fetch_variant(include, leagues_comma)
+    leagues_found: Set[int] = {lid for x in items if (lid := _extract_league_id(x)) is not None}
+    logger.debug("Variant-1 (comma) returned %d matches from leagues: %s", len(items), sorted(leagues_found))
+
+    # Eğer tek lig veya hiç veri geldiyse ikinci varyasyonu dene
+    if len(leagues_found) <= 1:
+        leagues_semicolon = ";".join(map(str, SUPPORTED_LEAGUE_IDS))
+        items2 = await _fetch_variant(include, leagues_semicolon)
+        leagues_found2: Set[int] = {lid for x in items2 if (lid := _extract_league_id(x)) is not None}
+        logger.debug("Variant-2 (semicolon) returned %d matches from leagues: %s", len(items2), sorted(leagues_found2))
+        if len(leagues_found2) > len(leagues_found):
+            items = items2
+            leagues_found = leagues_found2
+
+    # Hâlâ tek lig veya boşsa leagues paramını kaldırıp dene
+    if len(leagues_found) <= 1:
+        items3 = await _fetch_variant(include, None)
+        leagues_found3: Set[int] = {lid for x in items3 if (lid := _extract_league_id(x)) is not None}
+        logger.debug("Variant-3 (no leagues param) returned %d matches from leagues: %s", len(items3), sorted(leagues_found3))
+        if len(leagues_found3) > len(leagues_found):
+            items = items3
+            leagues_found = leagues_found3
+
+    # Ham dump istenirse
+    if DUMP_SM_RAW:
+        Path("logs").mkdir(parents=True, exist_ok=True)
+        with open("logs/sm_raw_livescores.json", "w", encoding="utf-8") as f:
+            json.dump({"data": items}, f, indent=2, ensure_ascii=False)
+        logger.debug("SM raw dump saved to logs/sm_raw_livescores.json")
+
+    # Çoklu lig bekleniyordu ama hâlâ tek ligse uyar
+    if len(leagues_found) <= 1:
+        logger.warning(
+            "SportMonks returned limited leagues: %s. "
+            "This likely indicates plan/authorization limitation or a required include format change. "
+            "Please verify subscribed/active leagues in SportMonks dashboard.",
+            sorted(leagues_found)
+        )
+
+    # Normalizasyon
+    normalized = []
+    for itm in items:
+        nm = _normalize_match(itm)
+        if nm["home_team"] == "Unknown" or nm["away_team"] == "Unknown":
+            logger.warning("SM name missing: mid=%s league=%s raw_paths=participants/localteam/teams",
+                           nm["match_id"], nm["league_id"])
+        normalized.append(nm)
+
+    logger.info("Normalized %d matches from leagues: %s", len(normalized), sorted({m['league_id'] for m in normalized if m.get('league_id') is not None}))
+    return normalized
+Kısa doğrulama komutları
+
+Terminalde iki hızlı test (senin önerdiğin akışa paralel):
+A) leagues parametresi olmadan:
+
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&include=participants;statistics;scores" | head -n 60
+B) Noktalı virgül ile:
+
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&leagues=143;181;556;208;5;648;462;8;9;11;82;251;384;479;968;38;72;1578;444;2;453;20;462;35376;944;1161;501;712;1034;32;567;62;591;404;600&include=participants;statistics;scores" | head -n 60
+Beklenen çıktı
+
+Loglarda şunları görmelisin:
+Variant-1 (comma) returned N matches from leagues: [...]
+Variant-2 (semicolon) returned N matches from leagues: [...]
+Variant-3 (no leagues param) returned N matches from leagues: [...]
+Normalized X matches from leagues: [8, 11, 251, 404, …]
+Eğer hepsinde sadece [968] görünüyorsa:
+Plan/authorization kısıtı var. SportMonks dashboard’da Subscribed → Active ligleri kontrol et. Gerekirse destekle iletişime geç.
+Notlar
+
+Bu yama production akışını bozmadan sorunu kendi kendine teşhis eder ve en geniş veri setini elde etmeyi dener.
+include setini geniş tuttum; minute, team names ve scores alanlarının gelme olasılığı artar.
+safe_request zaten rate-limit guard’ı sağlıyor; logger da DEBUG modda net iz veriyor.

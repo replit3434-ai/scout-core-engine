@@ -1,0 +1,270 @@
+Aşağıya “tak–çalıştır” patch set’i bırakıyorum: çok katmanlı minute parser + inplay fallback + son bilinen dakika cache (+elapsed) + monitoring. Hem TypeScript (adapter/frontend) hem Python (backend) için minimal ama üretim güvenli.
+
+1) TypeScript — Çok katmanlı parser + cache + inplay fallback hook
+Env:
+USE_INPLAY_FALLBACK=1
+LAST_MINUTE_CACHE_SEC=90
+STALE_MINUTE_THRESHOLD_SEC=120
+ts
+Copy
+// minute_utils.ts
+const USE_INPLAY_FALLBACK = (process.env.USE_INPLAY_FALLBACK ?? "1") === "1";
+const LAST_MINUTE_CACHE_SEC = Number(process.env.LAST_MINUTE_CACHE_SEC ?? 90);
+const STALE_MINUTE_THRESHOLD_SEC = Number(process.env.STALE_MINUTE_THRESHOLD_SEC ?? 120);
+
+type CacheVal = { minute: number; ts: number };
+const lastMinuteCache = new Map<string, CacheVal>();
+const lastChangeCache = new Map<string, CacheVal>(); // dakika değiştiği anı da tut
+
+export function calculateFromKickoff(match: any): number {
+  const ts = match?.time?.starting_at?.timestamp;
+  const iso = match?.time?.starting_at?.date_time || match?.time?.starting_at?.date;
+  let startMs = 0;
+  if (typeof ts === "number" && ts > 0) startMs = ts * 1000;
+  else if (iso) {
+    const dt = new Date(String(iso).replace(" ", "T"));
+    if (!isNaN(dt.getTime())) startMs = dt.getTime();
+  }
+  if (!startMs) return 0;
+  const elapsed = Math.max(0, Math.floor((Date.now() - startMs) / 60000));
+  return Math.min(elapsed, 130);
+}
+
+export function parseMinute(match: any): number {
+  // 1) Doğrudan alanlar
+  const direct =
+    match?.time?.minute ??
+    match?.time?.minutes ??
+    match?.time?.current?.minute ??
+    match?.live?.minute;
+  if (typeof direct === "number" && direct > 0) return direct;
+
+  // 2) periods
+  const p = match?.periods?.data;
+  if (Array.isArray(p) && p[0]?.minute > 0) return p[0].minute;
+
+  // 3) events (son olay)
+  const evs = match?.events?.data;
+  if (Array.isArray(evs) && evs.length) {
+    const last = evs[evs.length - 1];
+    if (typeof last?.minute === "number" && last.minute > 0) return last.minute;
+  }
+
+  // 4) kickoff'tan hesap
+  const fromKo = calculateFromKickoff(match);
+  return fromKo > 0 ? fromKo : 0;
+}
+
+export function applyMinuteCache(fixtureId: string, rawMinute: number): { minute: number; usedCache: boolean } {
+  const now = Date.now();
+
+  if (typeof rawMinute === "number" && rawMinute > 0) {
+    // Gerçek artış yakalandıysa change-cache’i güncelle
+    const prev = lastChangeCache.get(fixtureId);
+    if (!prev || rawMinute !== prev.minute) {
+      lastChangeCache.set(fixtureId, { minute: rawMinute, ts: now });
+    }
+    lastMinuteCache.set(fixtureId, { minute: rawMinute, ts: now });
+    return { minute: rawMinute, usedCache: false };
+  }
+
+  // rawMinute 0/null ise kısa süreli cache koruması
+  const cached = lastMinuteCache.get(fixtureId);
+  if (!cached) return { minute: 0, usedCache: false };
+
+  // “son bilinen + elapsed” (freeze maskesi)
+  const elapsedMin = Math.floor((now - cached.ts) / 60000);
+  const inflated = Math.min(130, cached.minute + Math.max(0, elapsedMin));
+
+  if (now - cached.ts < LAST_MINUTE_CACHE_SEC * 1000) {
+    return { minute: inflated, usedCache: true };
+  }
+  // cache süresi geçtiyse 0’a düş
+  return { minute: 0, usedCache: false };
+}
+
+export function isStaleMinute(fixtureId: string): boolean {
+  const lc = lastChangeCache.get(fixtureId);
+  if (!lc) return false;
+  return Date.now() - lc.ts > STALE_MINUTE_THRESHOLD_SEC * 1000;
+}
+
+// Inplay fallback hook (gerçek çağrıyı dışarıdan ver)
+export async function maybeHydrateFromInplay(
+  fixtureId: string,
+  minute: number,
+  fetchInplayFixture: (id: string) => Promise<any>
+): Promise<number> {
+  if (!USE_INPLAY_FALLBACK || minute > 0) return minute;
+  try {
+    const ip = await fetchInplayFixture(fixtureId); // fixtures/{id}?include=periods;events
+    const m = parseMinute(ip?.data ?? ip);
+    return m > 0 ? m : minute;
+  } catch {
+    return minute;
+  }
+}
+Kullanım (adapter):
+
+ts
+Copy
+// sportmonks-adapter.ts (özet)
+import { parseMinute, applyMinuteCache, isStaleMinute, maybeHydrateFromInplay } from "./minute_utils";
+
+async function normalizeFixture(raw: any) {
+  const id = String(raw?.id ?? raw?.fixture_id);
+  let m = parseMinute(raw);
+  const cacheRes = applyMinuteCache(id, m);
+  m = cacheRes.minute;
+
+  if (m === 0 || isStaleMinute(id)) {
+    m = await maybeHydrateFromInplay(id, m, fetchInplayFixture); // sizin mevcut client fonksiyonunuz
+  }
+
+  return { /* ...diğer alanlar... */ minute: m, meta: { usedCache: cacheRes.usedCache, stale: isStaleMinute(id) } };
+}
+2) Python — Aynı mantık (backend)
+Env:
+USE_INPLAY_FALLBACK=1
+LAST_MINUTE_CACHE_SEC=90
+STALE_MINUTE_THRESHOLD_SEC=120
+python
+Copy
+# minute_utils.py
+import os, time
+from typing import Any, Dict, Tuple, Optional
+
+USE_INPLAY_FALLBACK = os.getenv("USE_INPLAY_FALLBACK", "1") in ("1","true","True")
+LAST_MINUTE_CACHE_SEC = int(os.getenv("LAST_MINUTE_CACHE_SEC", "90"))
+STALE_MINUTE_THRESHOLD_SEC = int(os.getenv("STALE_MINUTE_THRESHOLD_SEC", "120"))
+
+_last_min_cache: Dict[str, Tuple[int, float]] = {}      # fixture_id -> (minute, ts)
+_last_change_cache: Dict[str, Tuple[int, float]] = {}   # dakikanın gerçekten değiştiği an
+
+def _from_kickoff(raw: Dict[str, Any]) -> int:
+    t = (raw.get("time") or {})
+    sa = (t.get("starting_at") or {})
+    ts = sa.get("timestamp")
+    now = int(time.time())
+    start = 0
+    if isinstance(ts, (int, float)) and ts > 0:
+        start = int(ts)
+    else:
+        iso = sa.get("date_time") or sa.get("date")
+        if iso:
+            try:
+                # "YYYY-MM-DD HH:MM:SS" veya "YYYY-MM-DDTHH:MM:SS"
+                base = iso.replace("T", " ")
+                tm = time.strptime(base.split("+")[0].strip(), "%Y-%m-%d %H:%M:%S")
+                start = int(time.mktime(tm))
+            except Exception:
+                pass
+    if not start:
+        return 0
+    elapsed = max(0, (now - start) // 60)
+    return min(elapsed, 130)
+
+def parse_minute(raw: Dict[str, Any]) -> int:
+    t = raw.get("time") or {}
+    for v in (t.get("minute"), t.get("minutes"), (t.get("current") or {}).get("minute"), (raw.get("live") or {}).get("minute")):
+        if isinstance(v, int) and v > 0:
+            return v
+    periods = (raw.get("periods") or {}).get("data")
+    if isinstance(periods, list) and periods and isinstance(periods[0].get("minute"), int) and periods[0]["minute"] > 0:
+        return periods[0]["minute"]
+    evs = (raw.get("events") or {})
+    if isinstance(evs, dict):
+        evs = evs.get("data")
+    if isinstance(evs, list) and evs:
+        v = evs[-1].get("minute")
+        if isinstance(v, int) and v > 0:
+            return v
+    ko = _from_kickoff(raw)
+    return ko if ko > 0 else 0
+
+def apply_minute_cache(fixture_id: str, raw_minute: int) -> Tuple[int, bool]:
+    now = time.time()
+    if isinstance(raw_minute, int) and raw_minute > 0:
+        prev = _last_change_cache.get(fixture_id)
+        if not prev or raw_minute != prev[0]:
+            _last_change_cache[fixture_id] = (raw_minute, now)
+        _last_min_cache[fixture_id] = (raw_minute, now)
+        return raw_minute, False
+    cached = _last_min_cache.get(fixture_id)
+    if not cached:
+        return 0, False
+    last_min, ts = cached
+    elapsed_min = max(0, int((now - ts) // 60))
+    inflated = min(130, last_min + elapsed_min)
+    if now - ts < LAST_MINUTE_CACHE_SEC:
+        return inflated, True
+    return 0, False
+
+def is_stale(fixture_id: str) -> bool:
+    lc = _last_change_cache.get(fixture_id)
+    if not lc:
+        return False
+    _, ts = lc
+    return (time.time() - ts) > STALE_MINUTE_THRESHOLD_SEC
+
+async def maybe_hydrate_from_inplay(fixture_id: str, minute: int, fetch_inplay_fixture):
+    if not USE_INPLAY_FALLBACK or minute > 0:
+        return minute
+    try:
+        ip = await fetch_inplay_fixture(fixture_id)  # fixtures/{id}?include=periods;events
+        raw = ip.get("data") if isinstance(ip, dict) else ip
+        m = parse_minute(raw)
+        return m if m > 0 else minute
+    except Exception:
+        return minute
+Kullanım (backend normalize):
+
+python
+Copy
+# sm_client.py (özet)
+from minute_utils import parse_minute, apply_minute_cache, is_stale, maybe_hydrate_from_inplay
+
+async def normalize_one(raw):
+    fid = str(raw.get("id") or raw.get("fixture_id") or raw.get("match_id"))
+    m = parse_minute(raw)
+    m, used_cache = apply_minute_cache(fid, m)
+    if m == 0 or is_stale(fid):
+        m = await maybe_hydrate_from_inplay(fid, m, fetch_inplay_fixture)
+    if m == 0:
+        return None  # pipeline dışla (opsiyon)
+    return { "match_id": fid, "minute": m, "meta": { "usedCache": used_cache, "stale": is_stale(fid) }, /* ... */ }
+3) Monitoring hooks
+“Weak Feed Detected” ve “Stale Minute” uyarıları için basit sayaçlar:
+python
+Copy
+# monitor.py
+weak_feed_cnt = 0
+total_cnt = 0
+
+def record_minute_stat(minute: int):
+    global weak_feed_cnt, total_cnt
+    total_cnt += 1
+    if minute == 0:
+        weak_feed_cnt += 1
+
+def snapshot_and_alert(logger, notifier):
+    global weak_feed_cnt, total_cnt
+    rate = (weak_feed_cnt / total_cnt) if total_cnt else 0
+    if rate >= 0.5:
+        logger.warning("Weak Feed Detected: minute=0 rate=%.0f%% last_5m", rate * 100)
+        # notifier.send("Weak Feed Detected ...")
+    weak_feed_cnt = 0
+    total_cnt = 0
+Frontend (opsiyonel küçük iyileştirme):
+
+Refetch/poll: 15–30 sn
+“Last updated” etiketi ve “stale” rozeti (isStale true geldiyse)
+4) Ticket metni (kopyala-yapıştır)
+“/v3/football/livescores returns minute=0/null for live fixtures while /fixtures/{id}?include=periods;events shows correct periods.minute. Please fix livescores mapping. Affected fixtures: […]. Also seeing freezes where minute remains stuck (e.g., 18).”
+
+Bu yamalarla:
+
+Dakika hiç gelmese bile kickoff’tan hesaplanır.
+Kısa feed boşluklarında “son bilinen + elapsed” ile akış korunur.
+Donma (freeze) tespitinde inplay fallback otomatik devreye girer.
+Dashboard canlı kalır, sahte sinyal üretmez.

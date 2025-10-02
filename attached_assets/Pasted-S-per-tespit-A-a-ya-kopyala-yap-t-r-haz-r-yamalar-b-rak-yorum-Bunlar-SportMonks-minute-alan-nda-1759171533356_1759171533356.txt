@@ -1,0 +1,142 @@
+Süper tespit. Aşağıya kopyala–yapıştır hazır yamaları bırakıyorum. Bunlar SportMonks minute alanındaki şema varyantlarını güvenli parse eder, takım isimlerini participants üzerinden sağlam alır ve minute=0 maçları kesin dışlar.
+
+SportMonks normalizasyonu (dakika + takım adı fallback’lı)
+Yeni/var olan dosya: server/services/providers/sportmonks-adapter.ts
+ts
+Copy
+// server/services/providers/sportmonks-adapter.ts
+
+// Çoklu-fallback minute parser
+export function extractMinute(m: any): number {
+  const t = m?.time ?? {};
+
+  // 1) En yaygın yollar
+  if (typeof t?.minute === 'number') return t.minute;
+  if (typeof t?.minutes === 'number') return t.minutes;
+
+  // 2) Bazı şema varyantları
+  if (typeof t?.current?.minute === 'number') return t.current.minute;
+  if (typeof m?.live?.minute === 'number') return m.live.minute;
+
+  // 3) Periods / timeline bazı feed'lerde
+  if (typeof m?.periods?.data?.[0]?.minute === 'number') return m.periods.data[0].minute;
+  if (typeof m?.periods?.first?.minute === 'number') return m.periods.first.minute;
+
+  // 4) Fallback: starting_at'tan hesapla (sadece status live ise)
+  const status = (m?.status?.name || m?.time?.status || '').toString().toUpperCase();
+  const liveStatuses = ['LIVE', 'INPLAY', '1ST_HALF', '2ND_HALF', 'ET', 'AET', 'PEN'];
+
+  const startTs =
+    t?.starting_at?.timestamp ??
+    (t?.starting_at ? Math.floor(Date.parse(t.starting_at) / 1000) : undefined);
+
+  if (startTs && liveStatuses.includes(status)) {
+    const now = Math.floor(Date.now() / 1000);
+    const elapsed = Math.max(0, Math.floor((now - startTs) / 60));
+    return Math.min(130, elapsed);
+  }
+
+  // 5) Hiçbiri yoksa 0 (başlamamış varsay)
+  return 0;
+}
+
+// Takım isimleri: participants ağırlıklı + legacy fallback
+export function extractTeams(m: any): { home: string; away: string } {
+  const parts =
+    m?.participants?.data ??
+    m?.participants ??
+    m?.teams?.data ??
+    m?.teams;
+
+  if (Array.isArray(parts) && parts.length >= 2) {
+    const homeP =
+      parts.find((p: any) => (p?.meta?.location || p?.location || p?.side) === 'home') ??
+      parts[0];
+    const awayP =
+      parts.find((p: any) => (p?.meta?.location || p?.location || p?.side) === 'away') ??
+      parts[1];
+
+    const home = homeP?.name || homeP?.short_code || m?.localteam?.data?.name;
+    const away = awayP?.name || awayP?.short_code || m?.visitorteam?.data?.name;
+
+    return { home: home || 'Unknown', away: away || 'Unknown' };
+  }
+
+  // Legacy path'ler
+  const lt = m?.localteam?.data?.name;
+  const vt = m?.visitorteam?.data?.name;
+  return { home: lt || 'Unknown', away: vt || 'Unknown' };
+}
+
+// Normalize edilmiş maç objesi
+export function normalizeSmMatch(raw: any) {
+  const { home, away } = extractTeams(raw);
+  const minute = extractMinute(raw);
+
+  return {
+    match_id: raw?.id ?? raw?.fixture_id ?? raw?.uuid,
+    league_id: raw?.league?.id ?? raw?.league_id,
+    home_team: home,
+    away_team: away,
+    minute,
+    score_home:
+      raw?.scores?.localteam_score ??
+      raw?.scores?.home ??
+      0,
+    score_away:
+      raw?.scores?.visitorteam_score ??
+      raw?.scores?.away ??
+      0,
+    status: raw?.status?.name ?? raw?.time?.status ?? '',
+    raw_time: raw?.time ?? null, // debug için
+  };
+}
+Core Engine’de minute=0 maçları sert şekilde dışla
+Var olan dosyada ilgili kısmı bu şekilde yap:
+server/services/core-engine.ts
+ts
+Copy
+// server/services/core-engine.ts
+import { normalizeSmMatch } from './providers/sportmonks-adapter';
+// ... diğer importlar
+
+// Canlı maçları normalize et ve filtrele
+const relevantMatches = liveMatches
+  .map(normalizeSmMatch)
+  .filter((m) =>
+    this.config.supportedLeagues.includes(Number(m.league_id)) &&
+    m.minute > 0 // MAÇ BAŞLAMAMIŞSA ASLA SÜRECE ALMA
+  )
+  .slice(0, this.config.maxConcurrentMatches);
+
+// Market Selector'a girmeden önce ham time objesini de logla (debug)
+for (const m of relevantMatches) {
+  logger.debug(
+    `BEFORE MS: ${m.home_team} vs ${m.away_team} | minute=${m.minute} | raw_time=${JSON.stringify(m.raw_time)}`
+  );
+  // ... market selector'a gönder
+}
+Livescores API parametrelerini güvenli tut
+Çalışan include seti:
+include=participants;statistics;scores;league
+teams/localteam/visitorteam ekleme: participants yeterli, bazı sürümlerde 404 riski var.
+leagues paramı opsiyonel. Tüm aktif ligler açıksa hiç koyma; performans için koyacaksan önce virgül, olmadı noktalı virgül dene.
+Örnek istekler (elle test):
+
+Tüm aktif ligler:
+https://api.sportmonks.com/v3/football/livescores?api_token=TOKEN&include=participants;statistics;scores;league
+Seçili ligler (virgül):
+https://api.sportmonks.com/v3/football/livescores?api_token=TOKEN&leagues=8,11,82&include=participants;statistics;scores;league
+Seçili ligler (noktalı virgül):
+https://api.sportmonks.com/v3/football/livescores?api_token=TOKEN&leagues=8;11;82&include=participants;statistics;scores;league
+Hızlı doğrulama checklist
+Log’da raw_time içinde minute veya starting_at var mı?
+normalizeSmMatch().minute > 0 olanlar UI’da LIVE görünüyor mu; 0 olanlar kesinlikle pipeline’a girmiyor mu?
+“Unknown vs Unknown” azaldı mı? (participants fallback çalışır)
+Market Selector öncesi debug logunda m=xx değerleri tutarlı mı?
+Bu yamayla:
+
+minute alanı 6 farklı yoldan okunur; gerekirse starting_at’tan hesaplanır
+takım isimleri participants/teams/localteam üzerinden sağlam alınır
+minute=0 maçlar dışlanır → “m=0” kaynaklı sahte sinyaller biter
+Hazırsan uygula; ilk loop’ta minute alanlarının dolduğunu ve MS’in düzgün çalıştığını loglarda göreceksin.

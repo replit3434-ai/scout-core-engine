@@ -1,0 +1,64 @@
+Teşhis doğru: “dakika donması” + “dashboard refresh kopması” birleşince 18’de takılı kalmış gibi görünüyor. Hızlı aksiyon ve kalıcı sertleştirme aşağıda.
+
+A) Backend — dakika akışını sağlamlaştır
+
+Inplay fallback’ı aç:
+USE_INPLAY_FALLBACK=1
+Son bilinen dakika cache’i (60–90 sn):
+minute=0 veya aynı dakika tekrar gelirse, son >0 değeri kısa süre koru.
+Stale minute tespiti (alarm + otomatik fallback tetikle):
+Eğer aynı fixture’da minute değişmiyorsa ve last_update_ts > 120 sn:
+WARN log yaz
+fixtures/inplay ile dakika kurtarmayı dene
+Örnek kontrol kodu (pseudo):
+
+python
+Copy
+  if minute == prev_minute and (now - last_update_ts) > 120:
+    logger.warning("minute stale >120s, triggering inplay fallback: %s", fixture_id)
+    minute = try_inplay_period_minute(fixture_id) or minute
+Hızlı doğrulama komutları:
+
+bash
+Copy
+# Livescores dakikalar akıyor mu?
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$KEY&include=participants;statistics;scores;league" \
+| jq '.data[]|{id,minute:.time.minute,status:.status.name}'
+
+# Inplay’da periods.minute var mı?
+curl "https://api.sportmonks.com/v3/football/fixtures/inplay?api_token=$KEY&include=periods;events" \
+| jq '.data[]|{id,pm: .periods.data[0].minute}'
+B) Frontend — canlı güncellemeyi garanti et
+
+WebSocket/Polling:
+React Query refetchInterval: 15–30 sn
+Visibility change’de refetchOnWindowFocus=true
+WS ping/pong veya otomatik reconnect (örn. 30 sn inactivity → reconnect)
+Manuel hızlı çözüm:
+Sayfayı yenile (WS yeniden bağlanır)
+UI watchdog (basit):
+Kart üzerinde “Last updated: hh:mm:ss”
+Eğer aynı dakikayı 120 sn’den uzun süre gösteriyorsa küçük “stale” rozeti
+C) İzleme ve alarmlar
+
+Loglarda beklenen:
+WARN: minute stale >120s, triggering inplay fallback
+LIVESCORES weak feed: X/Y minute=0
+Metrikler:
+minute_stale_rate (5 dk pencerede) < %20
+inplay_fallback_usage oranı
+Alarm:
+minute_stale_rate ≥ %50 (5 dk) → Slack/Telegram uyarı
+D) Olası kök neden teyidi
+
+Eğer livescores API yanıtı da 18’de takılıysa: %100 feed kaynaklı.
+Bizim cron loop/worker:
+“tick” logları düzenli geliyorsa loop çalışıyor demektir.
+E) Hızlı uygulama sırası (özet)
+
+.env: USE_INPLAY_FALLBACK=1, LAST_MINUTE_CACHE_SEC=90
+Backend’i restart et; logs’da “fallback” uyarılarını izle.
+Frontend: refetchInterval 15–30 sn, WS auto-reconnect aktif et.
+Tarayıcıda bir kez refresh.
+curl ve log komutlarıyla dakika akışını doğrula.
+Bunlarla hem gerçek dakikayı kurtarırız hem de dashboard’un canlılığı geri gelir.

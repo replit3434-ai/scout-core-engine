@@ -1,0 +1,355 @@
+"""
+Configuration Management
+=======================
+
+Scout Core Engine v6.0 konfigürasyon yönetimi
+"""
+
+import json
+import logging
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class Config:
+    """
+    Scout Core Engine konfigürasyon sınıfı
+    """
+    
+    # API Keys
+    sportmonks_api_key: str = ""
+    footystats_api_key: str = ""
+    
+    # API URLs
+    sportmonks_base_url: str = "https://api.sportmonks.com/v3/football"
+    footystats_base_url: str = "https://api.footystats.org/v2"
+    
+    # Engine Settings
+    update_interval: int = 30  # seconds
+    signal_ttl: int = 15  # minutes
+    max_concurrent_matches: int = 20
+    
+    # Supported Leagues
+    supported_leagues: List[int] = field(default_factory=lambda: [
+        8,    # Premier League
+        82,   # Bundesliga
+        564,  # La Liga
+        301,  # Ligue 1
+        384,  # Serie A
+        2,    # Champions League
+        5,    # Europa League
+        720,  # Turkish Super League
+    ])
+    
+    # Market Settings
+    market_settings: Dict[str, Dict] = field(default_factory=lambda: {
+        'over_under': {
+            'enabled': True,
+            'min_confidence': 0.65,
+            'max_signals_per_match': 2,
+            'supported_lines': [1.5, 2.5, 3.5]
+        },
+        'btts': {
+            'enabled': True,
+            'min_confidence': 0.60,
+            'max_signals_per_match': 1
+        },
+        'next_goal': {
+            'enabled': True,
+            'min_confidence': 0.70,
+            'max_signals_per_match': 1,
+            'min_minute': 10,
+            'max_minute': 80
+        },
+        'corners': {
+            'enabled': True,
+            'min_confidence': 0.55,
+            'max_signals_per_match': 2,
+            'supported_lines': [8.5, 9.5, 10.5, 11.5]
+        },
+        'cards': {
+            'enabled': True,
+            'min_confidence': 0.50,
+            'max_signals_per_match': 1,
+            'supported_lines': [2.5, 3.5, 4.5]
+        }
+    })
+    
+    # RL Agent Settings
+    rl_settings: Dict[str, Any] = field(default_factory=lambda: {
+        'learning_rate': 0.01,
+        'discount_factor': 0.95,
+        'epsilon': 0.1,
+        'epsilon_decay': 0.995,
+        'min_epsilon': 0.01,
+        'experience_buffer_size': 10000,
+        'batch_size': 32,
+        'update_frequency': 100,
+        'model_save_frequency': 1000
+    })
+    
+    # Data Quality Settings
+    data_quality: Dict[str, Any] = field(default_factory=lambda: {
+        'min_data_age': 5,  # seconds
+        'max_data_age': 300,  # seconds
+        'required_statistics': ['shots', 'possession', 'corners'],
+        'min_events_count': 1,
+        'odds_freshness_threshold': 60  # seconds
+    })
+    
+    # Logging Settings
+    log_level: str = "INFO"
+    log_file: str = "scout_core.log"
+    log_max_size: int = 10 * 1024 * 1024  # 10MB
+    log_backup_count: int = 5
+    
+    # Performance Settings
+    performance: Dict[str, Any] = field(default_factory=lambda: {
+        'max_memory_usage': 512,  # MB
+        'max_cpu_usage': 80,  # percentage
+        'request_timeout': 30,  # seconds
+        'max_retries': 3,
+        'retry_delay': 5  # seconds
+    })
+    
+    # Database Settings (future use)
+    database: Dict[str, str] = field(default_factory=lambda: {
+        'type': 'sqlite',
+        'path': 'scout_data.db',
+        'backup_frequency': 3600  # seconds
+    })
+    
+    # Notification Settings
+    notifications: Dict[str, Any] = field(default_factory=lambda: {
+        'enabled': False,
+        'webhook_url': '',
+        'min_confidence_for_notification': 0.75,
+        'markets_to_notify': ['over_under', 'btts', 'next_goal']
+    })
+    
+    def __init__(self, config_path: str = "config.json"):
+        """
+        Konfigürasyonu dosyadan yükle
+        
+        Args:
+            config_path: Konfigürasyon dosyası yolu
+        """
+        self.config_path = config_path
+        self._load_config()
+    
+    def _load_config(self):
+        """Konfigürasyon dosyasını yükle"""
+        try:
+            config_file = Path(self.config_path)
+            
+            if config_file.exists():
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config_data = json.load(f)
+                
+                # Konfigürasyon verilerini sınıf attribute'larına ata
+                for key, value in config_data.items():
+                    if hasattr(self, key):
+                        setattr(self, key, value)
+                
+                print(f"✅ Konfigürasyon yüklendi: {self.config_path}")
+            else:
+                # Default konfigürasyon dosyası oluştur
+                self._create_default_config()
+                print(f"📝 Default konfigürasyon oluşturuldu: {self.config_path}")
+                
+        except Exception as e:
+            print(f"❌ Konfigürasyon yükleme hatası: {e}")
+            print("🔄 Default değerler kullanılıyor")
+    
+    def _create_default_config(self):
+        """Default konfigürasyon dosyası oluştur"""
+        try:
+            default_config = {
+                "sportmonks_api_key": "YOUR_SPORTMONKS_API_KEY",
+                "footystats_api_key": "YOUR_FOOTYSTATS_API_KEY",
+                "sportmonks_base_url": self.sportmonks_base_url,
+                "footystats_base_url": self.footystats_base_url,
+                "update_interval": self.update_interval,
+                "signal_ttl": self.signal_ttl,
+                "max_concurrent_matches": self.max_concurrent_matches,
+                "supported_leagues": self.supported_leagues,
+                "market_settings": self.market_settings,
+                "rl_settings": self.rl_settings,
+                "data_quality": self.data_quality,
+                "log_level": self.log_level,
+                "log_file": self.log_file,
+                "log_max_size": self.log_max_size,
+                "log_backup_count": self.log_backup_count,
+                "performance": self.performance,
+                "database": self.database,
+                "notifications": self.notifications
+            }
+            
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, indent=4, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"❌ Default konfigürasyon oluşturma hatası: {e}")
+    
+    def save_config(self):
+        """Mevcut konfigürasyonu dosyaya kaydet"""
+        try:
+            config_data = {
+                "sportmonks_api_key": self.sportmonks_api_key,
+                "footystats_api_key": self.footystats_api_key,
+                "sportmonks_base_url": self.sportmonks_base_url,
+                "footystats_base_url": self.footystats_base_url,
+                "update_interval": self.update_interval,
+                "signal_ttl": self.signal_ttl,
+                "max_concurrent_matches": self.max_concurrent_matches,
+                "supported_leagues": self.supported_leagues,
+                "market_settings": self.market_settings,
+                "rl_settings": self.rl_settings,
+                "data_quality": self.data_quality,
+                "log_level": self.log_level,
+                "log_file": self.log_file,
+                "log_max_size": self.log_max_size,
+                "log_backup_count": self.log_backup_count,
+                "performance": self.performance,
+                "database": self.database,
+                "notifications": self.notifications
+            }
+            
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(config_data, f, indent=4, ensure_ascii=False)
+            
+            print(f"✅ Konfigürasyon kaydedildi: {self.config_path}")
+            
+        except Exception as e:
+            print(f"❌ Konfigürasyon kaydetme hatası: {e}")
+    
+    def update_setting(self, key: str, value: Any):
+        """
+        Tek bir ayarı güncelle
+        
+        Args:
+            key: Ayar anahtarı
+            value: Yeni değer
+        """
+        try:
+            if hasattr(self, key):
+                setattr(self, key, value)
+                print(f"✅ Ayar güncellendi: {key} = {value}")
+            else:
+                print(f"❌ Bilinmeyen ayar: {key}")
+                
+        except Exception as e:
+            print(f"❌ Ayar güncelleme hatası: {e}")
+    
+    def get_market_config(self, market_name: str) -> Dict:
+        """
+        Belirli bir market için konfigürasyon al
+        
+        Args:
+            market_name: Market adı
+            
+        Returns:
+            Market konfigürasyonu
+        """
+        return self.market_settings.get(market_name, {})
+    
+    def is_market_enabled(self, market_name: str) -> bool:
+        """
+        Market'in aktif olup olmadığını kontrol et
+        
+        Args:
+            market_name: Market adı
+            
+        Returns:
+            Market aktif mi?
+        """
+        market_config = self.get_market_config(market_name)
+        return market_config.get('enabled', False)
+    
+    def is_league_supported(self, league_id: int) -> bool:
+        """
+        Lig'in desteklenip desteklenmediğini kontrol et
+        
+        Args:
+            league_id: Lig ID'si
+            
+        Returns:
+            Lig destekleniyor mu?
+        """
+        return league_id in self.supported_leagues
+    
+    def get_api_credentials(self) -> Dict[str, str]:
+        """
+        API kimlik bilgilerini al
+        
+        Returns:
+            API credentials
+        """
+        return {
+            'sportmonks_api_key': self.sportmonks_api_key,
+            'footystats_api_key': self.footystats_api_key
+        }
+    
+    def validate_config(self) -> List[str]:
+        """
+        Konfigürasyonu doğrula
+        
+        Returns:
+            Hata listesi (boşsa konfigürasyon geçerli)
+        """
+        errors = []
+        
+        # API key kontrolü
+        if not self.sportmonks_api_key or self.sportmonks_api_key == "YOUR_SPORTMONKS_API_KEY":
+            errors.append("SportMonks API key eksik veya geçersiz")
+        
+        if not self.footystats_api_key or self.footystats_api_key == "YOUR_FOOTYSTATS_API_KEY":
+            errors.append("FootyStats API key eksik veya geçersiz")
+        
+        # Interval kontrolü
+        if self.update_interval < 10:
+            errors.append("Update interval çok düşük (minimum 10 saniye)")
+        
+        if self.signal_ttl < 5:
+            errors.append("Signal TTL çok düşük (minimum 5 dakika)")
+        
+        # League kontrolü
+        if not self.supported_leagues:
+            errors.append("Desteklenen lig listesi boş")
+        
+        # Market kontrolü
+        enabled_markets = [
+            market for market, config in self.market_settings.items()
+            if config.get('enabled', False)
+        ]
+        
+        if not enabled_markets:
+            errors.append("Hiçbir market aktif değil")
+        
+        return errors
+    
+    def get_summary(self) -> Dict[str, Any]:
+        """
+        Konfigürasyon özeti al
+        
+        Returns:
+            Konfigürasyon özeti
+        """
+        enabled_markets = [
+            market for market, config in self.market_settings.items()
+            if config.get('enabled', False)
+        ]
+        
+        return {
+            'api_configured': bool(self.sportmonks_api_key and self.footystats_api_key),
+            'update_interval': self.update_interval,
+            'signal_ttl': self.signal_ttl,
+            'supported_leagues_count': len(self.supported_leagues),
+            'enabled_markets': enabled_markets,
+            'enabled_markets_count': len(enabled_markets),
+            'log_level': self.log_level,
+            'rl_enabled': True,
+            'notifications_enabled': self.notifications.get('enabled', False)
+        }

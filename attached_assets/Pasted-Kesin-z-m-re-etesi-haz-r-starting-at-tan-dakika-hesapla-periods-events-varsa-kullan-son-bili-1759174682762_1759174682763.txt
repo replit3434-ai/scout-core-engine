@@ -1,0 +1,210 @@
+Kesin çözüm reçetesi hazır: starting_at’tan dakika hesapla + periods/events varsa kullan + “son bilinen dakika” cache’i ile 0’a düşmeyi maskele. Hepsi bayrakla aç/kapa.
+
+Python (sm_client.py) – 3 katmanlı minute fallback + kısa süreli cache
+Env bayrakları:
+USE_STARTING_AT_FALLBACK=1
+USE_INPLAY_FALLBACK=0/1 (varsa devam)
+LAST_MINUTE_CACHE_SEC=90
+python
+Copy
+# sm_client.py (ilgili yardımcılar)
+import os, time
+from typing import Dict, Any, Optional
+
+USE_STARTING_AT_FALLBACK = os.getenv("USE_STARTING_AT_FALLBACK", "1") in ("1","true","True")
+LAST_MINUTE_CACHE_SEC = int(os.getenv("LAST_MINUTE_CACHE_SEC", "90"))
+
+# match_id -> (minute, ts)
+_last_min_cache: Dict[str, tuple[int, float]] = {}
+
+def _fallback_minute_from_start(raw: Dict[str, Any]) -> int:
+    t = raw.get("time") or {}
+    sa = t.get("starting_at") or {}
+    # timestamp varsa direkt
+    ts = sa.get("timestamp")
+    if isinstance(ts, (int, float)) and ts > 0:
+        now = int(time.time())
+        elapsed = max(0, (now - int(ts)) // 60)
+        return min(elapsed, 130)
+    # ISO varsa parse et (opsiyonel)
+    iso = sa.get("date_time") or sa.get("date") or None
+    if iso:
+        try:
+            # "YYYY-MM-DD HH:MM:SS(+zzzz)" formatlarını güvenli kırp
+            base = iso.split("+")[0].replace("T", " ")
+            tm = time.strptime(base.strip(), "%Y-%m-%d %H:%M:%S")
+            ts2 = int(time.mktime(tm))
+            now = int(time.time())
+            elapsed = max(0, (now - ts2) // 60)
+            return min(elapsed, 130)
+        except Exception:
+            pass
+    return 0
+
+def _minute_from_periods_or_events(raw: Dict[str, Any]) -> Optional[int]:
+    periods = raw.get("periods") or {}
+    data = periods.get("data")
+    if isinstance(data, list) and data:
+        v = data[0].get("minute")
+        if isinstance(v, int) and v > 0:
+            return v
+    evs = raw.get("events")
+    if isinstance(evs, dict):
+        evs = evs.get("data")
+    if isinstance(evs, list) and evs:
+        mx = 0
+        for e in evs[:10]:
+            v = e.get("minute")
+            if isinstance(v, int) and v > mx:
+                mx = v
+        if mx > 0:
+            return mx
+    return None
+
+def _extract_minute_strong(raw: Dict[str, Any]) -> int:
+    # 1) time.minute, minutes, current.minute, live.minute
+    t = raw.get("time") or {}
+    for v in (t.get("minute"), t.get("minutes")):
+        if isinstance(v, int) and v > 0:
+            return v
+    cur = t.get("current") or {}
+    if isinstance(cur, dict):
+        v = cur.get("minute")
+        if isinstance(v, int) and v > 0:
+            return v
+    live = raw.get("live") or {}
+    if isinstance(live, dict):
+        v = live.get("minute")
+        if isinstance(v, int) and v > 0:
+            return v
+
+    # 2) periods/events (eğer include edilmiş geliyorsa)
+    v = _minute_from_periods_or_events(raw)
+    if isinstance(v, int) and v > 0:
+        return v
+
+    # 3) starting_at (env ile kontrollü)
+    if USE_STARTING_AT_FALLBACK:
+        v = _fallback_minute_from_start(raw)
+        if v > 0:
+            return v
+
+    # 4) yoksa 0
+    return 0
+
+def _apply_last_minute_cache(match_id: str, minute: int) -> int:
+    if minute > 0:
+        _last_min_cache[match_id] = (minute, time.time())
+        return minute
+    prev = _last_min_cache.get(match_id)
+    if not prev:
+        return 0
+    last_min, ts = prev
+    if time.time() - ts < LAST_MINUTE_CACHE_SEC:
+        # 0’a reset olmasın; kısa süreli eski >0 değeri koru
+        return last_min
+    return 0
+Normalizasyon aşamasında kullan:
+
+python
+Copy
+nm_minute = _extract_minute_strong(raw)        # çoklu-fallback
+nm_minute = _apply_last_minute_cache(str(mid), nm_minute)  # 0’ya düşmeyi 90sn maskele
+if nm_minute == 0:
+    # pipeline’dan dışla
+    continue
+TypeScript (Node/TS adapter’ında aynı mantık)
+Env: USE_STARTING_AT_FALLBACK=1
+Cache: Map<string, { minute: number; ts: number }>
+ts
+Copy
+// sportmonks-adapter.ts
+const USE_STARTING_AT_FALLBACK = (process.env.USE_STARTING_AT_FALLBACK ?? "1") === "1";
+const LAST_MINUTE_CACHE_SEC = Number(process.env.LAST_MINUTE_CACHE_SEC ?? 90);
+const lastMinuteCache = new Map<string, { minute: number; ts: number }>();
+
+function fallbackMinuteFromStart(raw: any): number {
+  const t = raw?.time ?? {};
+  const sa = t?.starting_at ?? {};
+  const ts = typeof sa?.timestamp === "number" ? sa.timestamp : undefined;
+  if (ts && ts > 0) {
+    const now = Math.floor(Date.now() / 1000);
+    const elapsed = Math.max(0, Math.floor((now - ts) / 60));
+    return Math.min(elapsed, 130);
+  }
+  const iso = sa?.date_time || sa?.date;
+  if (iso) {
+    const base = String(iso).split("+")[0].replace("T", " ");
+    const dt = new Date(base);
+    if (!isNaN(dt.getTime())) {
+      const now = Date.now();
+      const elapsed = Math.max(0, Math.floor((now - dt.getTime()) / 60000));
+      return Math.min(elapsed, 130);
+    }
+  }
+  return 0;
+}
+
+function minuteFromPeriodsOrEvents(raw: any): number | null {
+  const p = raw?.periods?.data;
+  if (Array.isArray(p) && p[0]?.minute > 0) return p[0].minute;
+  const evs = raw?.events?.data;
+  if (Array.isArray(evs) && evs.length) {
+    const mx = evs.slice(0, 10).reduce((acc, e) => (typeof e?.minute === "number" ? Math.max(acc, e.minute) : acc), 0);
+    return mx > 0 ? mx : null;
+  }
+  return null;
+}
+
+export function extractMinuteStrong(raw: any): number {
+  const t = raw?.time ?? {};
+  if (typeof t?.minute === "number" && t.minute > 0) return t.minute;
+  if (typeof t?.minutes === "number" && t.minutes > 0) return t.minutes;
+  if (typeof t?.current?.minute === "number" && t.current.minute > 0) return t.current.minute;
+  if (typeof raw?.live?.minute === "number" && raw.live.minute > 0) return raw.live.minute;
+
+  const pv = minuteFromPeriodsOrEvents(raw);
+  if (typeof pv === "number" && pv > 0) return pv;
+
+  if (USE_STARTING_AT_FALLBACK) {
+    const sv = fallbackMinuteFromStart(raw);
+    if (sv > 0) return sv;
+  }
+  return 0;
+}
+
+export function applyLastMinuteCache(matchId: string, minute: number): number {
+  if (minute > 0) {
+    lastMinuteCache.set(matchId, { minute, ts: Date.now() });
+    return minute;
+  }
+  const prev = lastMinuteCache.get(matchId);
+  if (!prev) return 0;
+  if (Date.now() - prev.ts < LAST_MINUTE_CACHE_SEC * 1000) {
+    return prev.minute;
+  }
+  return 0;
+}
+Kullanım:
+
+ts
+Copy
+let minute = extractMinuteStrong(raw);
+minute = applyLastMinuteCache(String(match_id), minute);
+if (minute === 0) return null; // pipeline dışı
+include paramı ve endpointler
+Livescores: include=participants;statistics;scores;league (sade)
+Plan izin verirse periods;events’i inplay’de kullan:
+/v3/football/fixtures/inplay?include=events;periods;statistics;participants
+Livescores boşsa dakika kurtarma için inplay fallback’i opsiyonel tut.
+Operasyonel denetim
+Log’la:
+RAW MINUTE DEBUG: {home} vs {away} | minute={m} | status={status} | has_starting_at={bool} | used_cache={bool}
+5 dakikada minute=0 oranı >= %50 ise uyarı (Slack/Telegram)
+Beklenen sonuç
+SportMonks time=null/status="" verse bile:
+starting_at’tan dakika hesaplanır,
+periods/events varsa oradan alınır,
+kısa kesintilerde 0’a düşme cache ile maskelenir,
+minute > 0 kuralı korunur, sahte sinyal yok.
+Uygula, USE_STARTING_AT_FALLBACK=1 ile aç; ilk loop’ta m değerlerinin dolduğunu göreceksin.

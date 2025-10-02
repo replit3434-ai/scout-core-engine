@@ -1,0 +1,500 @@
+"""
+Market Selector
+==============
+
+SportMonks + FootyStats verilerini birleştirerek hangi marketlerde 
+(Over/Under, BTTS, Next Goal vb.) aday sinyaller oluşacağını belirler.
+"""
+
+import logging
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+import numpy as np
+
+
+class MarketSelector:
+    """
+    Market seçim motoru - hangi marketlerde sinyal aranacağını belirler
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.logger = logging.getLogger("market_selector")
+        
+        # Market eşikleri
+        self.thresholds = {
+            'over_under': {
+                'min_confidence': 0.65,
+                'min_value_difference': 0.15,
+                'required_data_points': 5
+            },
+            'btts': {
+                'min_confidence': 0.60,
+                'min_percentage_difference': 10,
+                'required_games': 10
+            },
+            'next_goal': {
+                'min_momentum_score': 0.70,
+                'min_attack_difference': 20,
+                'required_events': 3
+            },
+            'corners': {
+                'min_confidence': 0.55,
+                'min_rate_difference': 2.0,
+                'required_minutes': 15
+            },
+            'cards': {
+                'min_confidence': 0.50,
+                'min_aggression_score': 0.60,
+                'required_fouls': 5
+            }
+        }
+    
+    async def select_markets(self, combined_data: Dict) -> List[Dict]:
+        """
+        Veri analizi yaparak aday marketleri seç
+        
+        Args:
+            combined_data: SportMonks + FootyStats birleşik verisi
+            
+        Returns:
+            Aday market listesi
+        """
+        try:
+            match_data = combined_data['match']
+            trend_data = combined_data['trends']
+            
+            candidate_markets = []
+            
+            # 1. Over/Under analizi
+            ou_candidates = await self._analyze_over_under(match_data, trend_data)
+            candidate_markets.extend(ou_candidates)
+            
+            # 2. BTTS analizi
+            btts_candidates = await self._analyze_btts(match_data, trend_data)
+            candidate_markets.extend(btts_candidates)
+            
+            # 3. Next Goal analizi
+            ng_candidates = await self._analyze_next_goal(match_data, trend_data)
+            candidate_markets.extend(ng_candidates)
+            
+            # 4. Corners analizi
+            corner_candidates = await self._analyze_corners(match_data, trend_data)
+            candidate_markets.extend(corner_candidates)
+            
+            # 5. Cards analizi
+            card_candidates = await self._analyze_cards(match_data, trend_data)
+            candidate_markets.extend(card_candidates)
+            
+            # Sonuçları filtrele ve sırala
+            filtered_markets = self._filter_and_rank_markets(candidate_markets)
+            
+            self.logger.debug(f"🎯 {len(filtered_markets)} aday market seçildi")
+            return filtered_markets
+            
+        except Exception as e:
+            self.logger.error(f"❌ Market seçimi hatası: {e}")
+            return []
+    
+    async def _analyze_over_under(self, match_data: Dict, trend_data: Dict) -> List[Dict]:
+        """Over/Under market analizi"""
+        candidates = []
+        
+        try:
+            # Mevcut skor
+            scores = match_data.get('scores', [])
+            current_total = sum([score.get('score', 0) for score in scores])
+            
+            # Maç dakikası
+            minute = match_data.get('time', {}).get('minute', 0)
+            
+            # Trend verileri
+            ou_trends = trend_data.get('over_under', {})
+            
+            # Over 1.5 analizi
+            if current_total == 0 and minute > 20:
+                over_1_5_prob = self._calculate_over_1_5_probability(match_data, ou_trends, minute)
+                
+                if over_1_5_prob > self.thresholds['over_under']['min_confidence']:
+                    candidates.append({
+                        'market': 'over_1_5',
+                        'selection': 'over',
+                        'confidence': over_1_5_prob,
+                        'reasoning': f"Dakika {minute}, skor 0-0, yüksek gol potansiyeli",
+                        'data_quality': self._assess_data_quality(match_data, 'over_under')
+                    })
+            
+            # Over 2.5 analizi
+            if current_total <= 1 and minute > 30:
+                over_2_5_prob = self._calculate_over_2_5_probability(match_data, ou_trends, minute)
+                
+                if over_2_5_prob > self.thresholds['over_under']['min_confidence']:
+                    candidates.append({
+                        'market': 'over_2_5',
+                        'selection': 'over',
+                        'confidence': over_2_5_prob,
+                        'reasoning': f"Dakika {minute}, toplam gol {current_total}, trend pozitif",
+                        'data_quality': self._assess_data_quality(match_data, 'over_under')
+                    })
+            
+            # Under analizi
+            if current_total >= 2 and minute > 60:
+                under_2_5_prob = self._calculate_under_probability(match_data, ou_trends, minute)
+                
+                if under_2_5_prob > self.thresholds['over_under']['min_confidence']:
+                    candidates.append({
+                        'market': 'under_2_5',
+                        'selection': 'under',
+                        'confidence': under_2_5_prob,
+                        'reasoning': f"Dakika {minute}, mevcut tempo düşük",
+                        'data_quality': self._assess_data_quality(match_data, 'over_under')
+                    })
+            
+            return candidates
+            
+        except Exception as e:
+            self.logger.error(f"❌ Over/Under analizi hatası: {e}")
+            return []
+    
+    async def _analyze_btts(self, match_data: Dict, trend_data: Dict) -> List[Dict]:
+        """BTTS (Both Teams To Score) analizi"""
+        candidates = []
+        
+        try:
+            # Mevcut skor durumu
+            home_goals = 0
+            away_goals = 0
+            
+            scores = match_data.get('scores', [])
+            for score in scores:
+                if score.get('description') == 'CURRENT':
+                    home_goals = score.get('score', {}).get('localteam', 0)
+                    away_goals = score.get('score', {}).get('visitorteam', 0)
+            
+            # Maç dakikası
+            minute = match_data.get('time', {}).get('minute', 0)
+            
+            # BTTS trend verileri
+            btts_trends = trend_data.get('btts', {})
+            
+            # BTTS Yes analizi
+            if (home_goals == 0 or away_goals == 0) and minute < 75:
+                btts_yes_prob = self._calculate_btts_yes_probability(match_data, btts_trends, minute)
+                
+                if btts_yes_prob > self.thresholds['btts']['min_confidence']:
+                    candidates.append({
+                        'market': 'btts',
+                        'selection': 'yes',
+                        'confidence': btts_yes_prob,
+                        'reasoning': f"Dakika {minute}, bir takım henüz gol atmadı, trend pozitif",
+                        'data_quality': self._assess_data_quality(match_data, 'btts')
+                    })
+            
+            # BTTS No analizi
+            if home_goals > 0 and away_goals > 0 and minute > 70:
+                btts_no_prob = self._calculate_btts_no_probability(match_data, btts_trends, minute)
+                
+                if btts_no_prob > self.thresholds['btts']['min_confidence']:
+                    candidates.append({
+                        'market': 'btts',
+                        'selection': 'no',
+                        'confidence': btts_no_prob,
+                        'reasoning': f"Dakika {minute}, her iki takım da gol attı, savunma güçlü",
+                        'data_quality': self._assess_data_quality(match_data, 'btts')
+                    })
+            
+            return candidates
+            
+        except Exception as e:
+            self.logger.error(f"❌ BTTS analizi hatası: {e}")
+            return []
+    
+    async def _analyze_next_goal(self, match_data: Dict, trend_data: Dict) -> List[Dict]:
+        """Next Goal analizi"""
+        candidates = []
+        
+        try:
+            # Momentum analizi
+            momentum_score = self._calculate_momentum(match_data)
+            
+            if momentum_score['home'] > self.thresholds['next_goal']['min_momentum_score']:
+                candidates.append({
+                    'market': 'next_goal',
+                    'selection': 'home',
+                    'confidence': momentum_score['home'],
+                    'reasoning': f"Ev sahibi momentum: {momentum_score['home']:.2f}",
+                    'data_quality': self._assess_data_quality(match_data, 'next_goal')
+                })
+            
+            if momentum_score['away'] > self.thresholds['next_goal']['min_momentum_score']:
+                candidates.append({
+                    'market': 'next_goal',
+                    'selection': 'away',
+                    'confidence': momentum_score['away'],
+                    'reasoning': f"Deplasman momentum: {momentum_score['away']:.2f}",
+                    'data_quality': self._assess_data_quality(match_data, 'next_goal')
+                })
+            
+            return candidates
+            
+        except Exception as e:
+            self.logger.error(f"❌ Next Goal analizi hatası: {e}")
+            return []
+    
+    async def _analyze_corners(self, match_data: Dict, trend_data: Dict) -> List[Dict]:
+        """Corners analizi"""
+        candidates = []
+        
+        try:
+            # Mevcut korner sayıları
+            stats = match_data.get('statistics', {})
+            home_corners = stats.get('home', {}).get('corners', 0)
+            away_corners = stats.get('away', {}).get('corners', 0)
+            total_corners = home_corners + away_corners
+            
+            # Maç dakikası
+            minute = match_data.get('time', {}).get('minute', 0)
+            
+            # Korner trend verileri
+            corner_trends = trend_data.get('corners', {})
+            
+            # Over corners analizi
+            if minute > 15:
+                corner_rate = total_corners / (minute / 90) if minute > 0 else 0
+                expected_total = corner_rate * 90
+                
+                if expected_total > 9.5:
+                    confidence = min(0.95, expected_total / 12)
+                    
+                    candidates.append({
+                        'market': 'total_corners',
+                        'selection': 'over_9_5',
+                        'confidence': confidence,
+                        'reasoning': f"Dakika {minute}, mevcut oran: {corner_rate:.1f}/90dk",
+                        'data_quality': self._assess_data_quality(match_data, 'corners')
+                    })
+            
+            return candidates
+            
+        except Exception as e:
+            self.logger.error(f"❌ Corners analizi hatası: {e}")
+            return []
+    
+    async def _analyze_cards(self, match_data: Dict, trend_data: Dict) -> List[Dict]:
+        """Cards analizi"""
+        candidates = []
+        
+        try:
+            # Mevcut kart sayıları
+            stats = match_data.get('statistics', {})
+            home_yellows = stats.get('home', {}).get('cards_yellow', 0)
+            away_yellows = stats.get('away', {}).get('cards_yellow', 0)
+            home_reds = stats.get('home', {}).get('cards_red', 0)
+            away_reds = stats.get('away', {}).get('cards_red', 0)
+            
+            total_cards = home_yellows + away_yellows + (home_reds * 2) + (away_reds * 2)
+            
+            # Faul sayıları
+            home_fouls = stats.get('home', {}).get('fouls', 0)
+            away_fouls = stats.get('away', {}).get('fouls', 0)
+            total_fouls = home_fouls + away_fouls
+            
+            # Maç dakikası
+            minute = match_data.get('time', {}).get('minute', 0)
+            
+            # Agresiflik skoru
+            aggression_score = self._calculate_aggression_score(total_fouls, total_cards, minute)
+            
+            if aggression_score > self.thresholds['cards']['min_aggression_score'] and minute > 20:
+                candidates.append({
+                    'market': 'total_cards',
+                    'selection': 'over_3_5',
+                    'confidence': min(0.90, aggression_score),
+                    'reasoning': f"Yüksek agresiflik: {aggression_score:.2f}, faul: {total_fouls}",
+                    'data_quality': self._assess_data_quality(match_data, 'cards')
+                })
+            
+            return candidates
+            
+        except Exception as e:
+            self.logger.error(f"❌ Cards analizi hatası: {e}")
+            return []
+    
+    def _calculate_over_1_5_probability(self, match_data: Dict, trends: Dict, minute: int) -> float:
+        """Over 1.5 olasılığını hesapla"""
+        try:
+            # Basit model - gerçek implementasyonda daha karmaşık olacak
+            base_prob = 0.75  # Genel over 1.5 olasılığı
+            
+            # Dakika faktörü
+            time_factor = max(0.5, (90 - minute) / 90)
+            
+            # İstatistik faktörü
+            stats = match_data.get('statistics', {})
+            total_shots = (stats.get('home', {}).get('shots_total', 0) + 
+                          stats.get('away', {}).get('shots_total', 0))
+            
+            shot_factor = min(1.2, 1 + (total_shots - 10) * 0.02) if total_shots > 10 else 1.0
+            
+            probability = base_prob * time_factor * shot_factor
+            return min(0.95, max(0.05, probability))
+            
+        except Exception:
+            return 0.5
+    
+    def _calculate_over_2_5_probability(self, match_data: Dict, trends: Dict, minute: int) -> float:
+        """Over 2.5 olasılığını hesapla"""
+        try:
+            base_prob = 0.55
+            time_factor = max(0.3, (90 - minute) / 90)
+            
+            # Saldırı istatistikleri
+            stats = match_data.get('statistics', {})
+            attacks = (stats.get('home', {}).get('attacks', 0) + 
+                      stats.get('away', {}).get('attacks', 0))
+            
+            attack_factor = min(1.3, 1 + (attacks - 100) * 0.003) if attacks > 100 else 1.0
+            
+            probability = base_prob * time_factor * attack_factor
+            return min(0.90, max(0.10, probability))
+            
+        except Exception:
+            return 0.5
+    
+    def _calculate_under_probability(self, match_data: Dict, trends: Dict, minute: int) -> float:
+        """Under olasılığını hesapla"""
+        try:
+            # Geç dakikalarda under daha güvenli
+            if minute > 75:
+                return 0.70
+            elif minute > 60:
+                return 0.60
+            else:
+                return 0.40
+                
+        except Exception:
+            return 0.5
+    
+    def _calculate_btts_yes_probability(self, match_data: Dict, trends: Dict, minute: int) -> float:
+        """BTTS Yes olasılığını hesapla"""
+        try:
+            base_prob = 0.50
+            
+            # Kalan süre faktörü
+            remaining_time = 90 - minute
+            time_factor = remaining_time / 90
+            
+            # Saldırı potansiyeli
+            stats = match_data.get('statistics', {})
+            home_shots = stats.get('home', {}).get('shots_on_goal', 0)
+            away_shots = stats.get('away', {}).get('shots_on_goal', 0)
+            
+            shot_factor = min(1.5, 1 + (home_shots + away_shots) * 0.05)
+            
+            probability = base_prob * time_factor * shot_factor
+            return min(0.85, max(0.15, probability))
+            
+        except Exception:
+            return 0.5
+    
+    def _calculate_btts_no_probability(self, match_data: Dict, trends: Dict, minute: int) -> float:
+        """BTTS No olasılığını hesapla"""
+        try:
+            # Geç dakikalarda no daha güvenli
+            if minute > 80:
+                return 0.75
+            elif minute > 70:
+                return 0.65
+            else:
+                return 0.45
+                
+        except Exception:
+            return 0.5
+    
+    def _calculate_momentum(self, match_data: Dict) -> Dict:
+        """Takım momentumunu hesapla"""
+        try:
+            stats = match_data.get('statistics', {})
+            events = match_data.get('events', [])
+            
+            # Son 10 dakikadaki olayları analiz et
+            minute = match_data.get('time', {}).get('minute', 0)
+            recent_events = [e for e in events if e.get('minute', 0) > minute - 10]
+            
+            home_momentum = 0.5
+            away_momentum = 0.5
+            
+            # Olay bazlı momentum
+            for event in recent_events:
+                if event.get('type') in ['goal', 'substitution', 'yellowcard']:
+                    # Basit momentum hesabı
+                    pass
+            
+            # İstatistik bazlı momentum
+            home_attacks = stats.get('home', {}).get('attacks', 0)
+            away_attacks = stats.get('away', {}).get('attacks', 0)
+            
+            if home_attacks + away_attacks > 0:
+                home_momentum = home_attacks / (home_attacks + away_attacks)
+                away_momentum = away_attacks / (home_attacks + away_attacks)
+            
+            return {'home': home_momentum, 'away': away_momentum}
+            
+        except Exception:
+            return {'home': 0.5, 'away': 0.5}
+    
+    def _calculate_aggression_score(self, fouls: int, cards: int, minute: int) -> float:
+        """Agresiflik skorunu hesapla"""
+        try:
+            if minute == 0:
+                return 0.0
+            
+            foul_rate = fouls / minute * 90
+            card_rate = cards / minute * 90
+            
+            # Normalize edilmiş agresiflik skoru
+            aggression = (foul_rate / 30) + (card_rate / 6)
+            return min(1.0, aggression)
+            
+        except Exception:
+            return 0.0
+    
+    def _assess_data_quality(self, match_data: Dict, market_type: str) -> float:
+        """Veri kalitesini değerlendir"""
+        try:
+            quality_score = 0.5
+            
+            # Temel veri kontrolü
+            if match_data.get('statistics'):
+                quality_score += 0.2
+            
+            if match_data.get('events'):
+                quality_score += 0.2
+            
+            if match_data.get('time', {}).get('minute', 0) > 0:
+                quality_score += 0.1
+            
+            return min(1.0, quality_score)
+            
+        except Exception:
+            return 0.3
+    
+    def _filter_and_rank_markets(self, candidates: List[Dict]) -> List[Dict]:
+        """Aday marketleri filtrele ve sırala"""
+        try:
+            # Minimum güven seviyesi filtresi
+            filtered = [
+                candidate for candidate in candidates
+                if candidate.get('confidence', 0) > 0.5 and
+                   candidate.get('data_quality', 0) > 0.3
+            ]
+            
+            # Güven seviyesine göre sırala
+            filtered.sort(key=lambda x: x.get('confidence', 0), reverse=True)
+            
+            # En fazla 5 aday market döndür
+            return filtered[:5]
+            
+        except Exception as e:
+            self.logger.error(f"❌ Market filtreleme hatası: {e}")
+            return candidates

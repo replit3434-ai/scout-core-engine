@@ -1,0 +1,295 @@
+Harika plan. Şimdi “Active Signal Service”i Scout Core Engine’e, Replit/Contabo uyumlu şekilde, tek seferde devreye alabileceğin minimal ama üretim-uygun bir paket olarak veriyorum.
+
+Ne getiriyoruz
+
+Signal State Machine: PRE → CANDIDATE → ACTIVE → EXPIRED
+TTL, confidence, liquidity ve priority tabanlı olgunlaştırma
+Dedupe + cooldown
+WebSocket yayın + REST API: /active-signals ve ws://.../ws/active-signals
+Core Engine entegrasyonu (signal_candidates → service.update)
+Konfig env ile (eşikler ve limitler)
+requirements.txt (eklemeler)
+text
+Copy
+fastapi>=0.110.0
+uvicorn[standard]>=0.23.0
+utils/signal_models.py
+python
+Copy
+from dataclasses import dataclass, field
+from typing import Optional, Dict
+import time
+
+SignalState = str  # "PRE" | "CANDIDATE" | "ACTIVE" | "EXPIRED"
+
+@dataclass
+class Signal:
+    id: str                     # unique: f"{match_id}:{market}"
+    match_id: str
+    market: str                 # e.g., "over_2_5"
+    home: str
+    away: str
+    confidence: float           # 0..1
+    minute: int
+    liquidity_ok: bool = True
+    ttl_seconds: int = 15 * 60  # 15 dk default
+    state: SignalState = "PRE"
+    created_ts: float = field(default_factory=time.time)
+    last_update_ts: float = field(default_factory=time.time)
+    meta: Dict = field(default_factory=dict)
+
+    def age(self) -> float:
+        return time.time() - self.created_ts
+
+    def time_left(self) -> float:
+        return max(0.0, self.ttl_seconds - self.age())
+services/active_signal_service.py
+python
+Copy
+import os
+import time
+from typing import Dict, List, Tuple
+from utils.signal_models import Signal
+from utils.logger import get_logger
+
+log = get_logger("active_signal_service")
+
+CONF_ACTIVE = float(os.getenv("CONF_ACTIVE", "0.65"))  # 65%
+MAX_ACTIVE = int(os.getenv("MAX_ACTIVE", "10"))         # UI üst sınır
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "300"))    # aynı id için 5 dk
+MATURATION_WINDOW = int(os.getenv("MATURATION_WINDOW", "60"))  # cand->active min 60s
+
+class ActiveSignalService:
+    def __init__(self):
+        self.signals: Dict[str, Signal] = {}     # all live (non-expired)
+        self.cooldown: Dict[str, float] = {}     # last ACTIVE ts by id
+
+    def _priority(self, s: Signal) -> Tuple[int, float]:
+        # Küçük tuple daha yüksek öncelik: (-confidence, remaining_time)
+        return (-s.confidence, s.time_left())
+
+    def _dedupe(self, s: Signal) -> bool:
+        # Aynı id son 5 dk içinde ACTIVE olmuşsa atla
+        last = self.cooldown.get(s.id)
+        if last and (time.time() - last) < COOLDOWN_SEC:
+            return False
+        return True
+
+    def _promote(self, s: Signal):
+        # PRE -> CANDIDATE: threshold karşılandı
+        if s.state == "PRE" and s.confidence >= 0.50 and s.liquidity_ok:
+            s.state = "CANDIDATE"
+            log.debug("Promoted to CANDIDATE: %s", s.id)
+
+        # CANDIDATE -> ACTIVE: yeterli süre ve eşik
+        if s.state == "CANDIDATE" and s.confidence >= CONF_ACTIVE and s.age() >= MATURATION_WINDOW and s.liquidity_ok:
+            if self._dedupe(s):
+                s.state = "ACTIVE"
+                self.cooldown[s.id] = time.time()
+                log.info("Promoted to ACTIVE: %s (conf=%.2f, ttl=%ds)", s.id, s.confidence, s.ttl_seconds)
+
+    def _expire(self, s: Signal) -> bool:
+        # TTL bitti veya maç bitti vs. (minute >= 90 ve ek kriter) gibi genişletilebilir
+        if s.time_left() <= 0:
+            s.state = "EXPIRED"
+            return True
+        return False
+
+    def update(self, candidates: List[Signal]) -> List[Signal]:
+        # Yeni gelen adayları merge et
+        now = time.time()
+        for s in candidates:
+            s.last_update_ts = now
+            existing = self.signals.get(s.id)
+            if existing:
+                # Güncelleme: daha güncel confidence/minute/meta ile yaz
+                existing.confidence = s.confidence
+                existing.minute = s.minute
+                existing.meta.update(s.meta or {})
+                existing.last_update_ts = now
+                # TTL dinamik ise burada güncellenebilir
+                s = existing
+            else:
+                self.signals[s.id] = s
+            # State ilerlet
+            if s.state in ("PRE", "CANDIDATE"):
+                self._promote(s)
+
+        # Expire temizliği
+        to_delete = []
+        for sid, s in self.signals.items():
+            if self._expire(s):
+                to_delete.append(sid)
+        for sid in to_delete:
+            del self.signals[sid]
+
+        # ACTIVE’leri önceliğe göre sırala ve üst sınır uygula
+        actives = [s for s in self.signals.values() if s.state == "ACTIVE"]
+        actives.sort(key=self._priority)
+        if len(actives) > MAX_ACTIVE:
+            actives = actives[:MAX_ACTIVE]
+        log.debug("Active signals selected: %d", len(actives))
+        return actives
+
+    def snapshot(self) -> Dict:
+        # UI/WS için hafif snapshot
+        active = [s for s in self.signals.values() if s.state == "ACTIVE"]
+        active.sort(key=self._priority)
+        active = active[:MAX_ACTIVE]
+        return {
+            "active": [
+                {
+                    "id": s.id,
+                    "match_id": s.match_id,
+                    "market": s.market,
+                    "home": s.home,
+                    "away": s.away,
+                    "confidence": s.confidence,
+                    "minute": s.minute,
+                    "ttl_left": int(s.time_left()),
+                    "state": s.state,
+                } for s in active
+            ],
+            "counts": {
+                "PRE": sum(1 for s in self.signals.values() if s.state == "PRE"),
+                "CANDIDATE": sum(1 for s in self.signals.values() if s.state == "CANDIDATE"),
+                "ACTIVE": len(active),
+            }
+        }
+api/server.py (FastAPI + WebSocket yayın)
+python
+Copy
+import asyncio
+import json
+from typing import Set
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from services.active_signal_service import ActiveSignalService
+from utils.logger import get_logger
+
+log = get_logger("api")
+app = FastAPI(title="Scout Active Signal Service")
+svc = ActiveSignalService()
+clients: Set[WebSocket] = set()
+
+@app.get("/active-signals")
+async def get_active_signals():
+    return JSONResponse(svc.snapshot())
+
+@app.websocket("/ws/active-signals")
+async def ws_active_signals(ws: WebSocket):
+    await ws.accept()
+    clients.add(ws)
+    log.info("WS connected (%d)", len(clients))
+    try:
+        # İlk snapshot anında
+        await ws.send_text(json.dumps(svc.snapshot()))
+        while True:
+            # Client ping/pong için minimal loop (gerekirse dinle)
+            msg = await ws.receive_text()
+            if msg == "ping":
+                await ws.send_text("pong")
+    except WebSocketDisconnect:
+        pass
+    finally:
+        clients.discard(ws)
+        log.info("WS disconnected (%d)", len(clients))
+
+async def broadcast_snapshot():
+    data = json.dumps(svc.snapshot())
+    dead = []
+    for ws in clients:
+        try:
+            await ws.send_text(data)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        clients.discard(ws)
+
+# Dışarıdan servis güncellenince çağrılacak
+async def push_update():
+    if clients:
+        await broadcast_snapshot()
+
+# Servisi başka kod kullanacak: from api.server import svc, push_update
+core_engine.py entegrasyonu (kısa örnek)
+python
+Copy
+import asyncio
+import os
+from utils.logger import get_logger
+from utils.signal_models import Signal
+from services.active_signal_service import ActiveSignalService
+from api.server import app, svc, push_update  # svc paylaşılan instance
+from utils.telegram_notifier import send_signal
+
+log = get_logger("core_engine")
+
+async def generate_candidates_once() -> list[Signal]:
+    # Burada gerçek maçlardan ve karar motorundan üretim yapılır.
+    # Örnek candidate:
+    return [
+        Signal(
+            id="19424927:over_2_5",
+            match_id="19424927",
+            market="over_2_5",
+            home="Juventus",
+            away="Milan",
+            confidence=0.72,
+            minute=55,
+            ttl_seconds=15*60,
+            state="PRE",
+            meta={"volatility": 0.3}
+        )
+    ]
+
+async def main_loop():
+    log.debug("Core loop starting...")
+    interval = int(os.getenv("UPDATE_INTERVAL", "30"))
+    while True:
+        try:
+            candidates = await generate_candidates_once()
+            actives = svc.update(candidates)
+            # İstersen aktif olanları Telegram’a gönder (dedupe zaten servis içinde var)
+            for s in actives:
+                # Sadece yeni ACTIVE olanlar için bir dış işaretleme yapmak istersen meta flag ekleyebilirsin
+                msg = f"⚽️ ACTIVE: {s.market} – {s.home} vs {s.away}\nConfidence: %{int(s.confidence*100)}\nMinute: {s.minute}'"
+                send_signal(msg)
+            # UI/WS’e snapshot yayınla
+            await push_update()
+        except Exception as e:
+            log.exception("Core loop error: %s", e)
+        await asyncio.sleep(interval)
+
+if __name__ == "__main__":
+    # Uvicorn FastAPI + core loop’u aynı process’te koşturmak istersen:
+    # Replit’te ayrı process daha iyi olabilir. Tek process basit örnek için:
+    import uvicorn
+    loop = asyncio.get_event_loop()
+    loop.create_task(main_loop())
+    uvicorn.run("api.server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), log_level="info")
+Çalıştırma seçenekleri
+Tek süreç (kolay): core_engine.py’yi çalıştır; uvicorn’u içinde başlatır ve WebSocket/REST açılır.
+İki süreç (daha izole):
+Süreç 1: uvicorn api.server:app --host 0.0.0.0 --port 8000
+Süreç 2: core_engine.py (svc ve push_update için basit IPC gerekir; bu örnekte tek süreç öneriyorum)
+.replit (tek süreç senaryosu)
+toml
+Copy
+run = "python core_engine.py"
+Env önerileri
+CONF_ACTIVE=0.65
+MAX_ACTIVE=10
+COOLDOWN_SEC=300
+MATURATION_WINDOW=60
+UPDATE_INTERVAL=30
+Notlar
+
+Service, candidates → ACTIVE dönüşümünde dedupe + cooldown uygular.
+TTL dolanlar EXPIRED edilir, snapshot’tan düşer.
+WebSocket’e ilk bağlanınca snapshot gönderilir, sonra her loop’ta push_update ile yayınlanır.
+Frontend:
+REST: GET /active-signals
+WS: ws:///ws/active-signals
+React Query ile poll + WS ile real-time kolayca bağlanır.
+İstersen bu yapıyı Redis Pub/Sub veya SQLite kalıcılık ile güçlendirebiliriz; ama ilk aşamada in-memory, tek proses çözüm en hızlı ve yeterince sağlam.

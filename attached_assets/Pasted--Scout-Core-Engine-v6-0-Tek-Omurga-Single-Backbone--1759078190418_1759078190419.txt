@@ -1,0 +1,292 @@
+"""
+Scout Core Engine v6.0 - Tek Omurga (Single Backbone)
+====================================================
+
+Ana motor: Tüm veri sağlayıcıları ve karar modüllerini koordine eder.
+Tek çıktı: Final sinyal listesi
+"""
+
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+import json
+
+# Local imports
+from data_providers.sm_client import SportMonksClient
+from data_providers.fs_client import FootyStatsClient
+from decision_engines.market_selector import MarketSelector
+from decision_engines.rl_agent import RLAgent
+from utils.config import Config
+from utils.logger import setup_logger
+
+
+class ScoutCoreEngine:
+    """
+    Scout'un tek omurgası - tüm bileşenleri koordine eden ana motor
+    """
+    
+    def __init__(self, config_path: str = "config.json"):
+        """
+        Core Engine'i başlat
+        
+        Args:
+            config_path: Konfigürasyon dosyası yolu
+        """
+        self.config = Config(config_path)
+        self.logger = setup_logger("scout_core", self.config.log_level)
+        
+        # Veri sağlayıcıları
+        self.sm_client = SportMonksClient(
+            api_key=self.config.sportmonks_api_key,
+            base_url=self.config.sportmonks_base_url
+        )
+        
+        self.fs_client = FootyStatsClient(
+            api_key=self.config.footystats_api_key,
+            base_url=self.config.footystats_base_url
+        )
+        
+        # Karar motorları
+        self.market_selector = MarketSelector(config=self.config)
+        self.rl_agent = RLAgent(config=self.config)
+        
+        # Engine durumu
+        self.is_running = False
+        self.last_update = None
+        self.active_matches = {}
+        self.generated_signals = []
+        
+        self.logger.info("🚀 Scout Core Engine v6.0 başlatıldı")
+    
+    async def start_engine(self):
+        """
+        Ana motoru başlat - sürekli çalışan ana döngü
+        """
+        self.is_running = True
+        self.logger.info("⚡ Core Engine başlatılıyor...")
+        
+        try:
+            while self.is_running:
+                await self._main_loop()
+                await asyncio.sleep(self.config.update_interval)
+                
+        except Exception as e:
+            self.logger.error(f"❌ Core Engine hatası: {e}")
+            raise
+        finally:
+            self.is_running = False
+            self.logger.info("🛑 Core Engine durduruldu")
+    
+    async def stop_engine(self):
+        """
+        Ana motoru durdur
+        """
+        self.logger.info("🛑 Core Engine durduruluyor...")
+        self.is_running = False
+    
+    async def _main_loop(self):
+        """
+        Ana işlem döngüsü - tek omurga mantığı
+        """
+        try:
+            # 1. Canlı maçları al
+            live_matches = await self._get_live_matches()
+            
+            if not live_matches:
+                self.logger.debug("📊 Aktif canlı maç bulunamadı")
+                return
+            
+            # 2. Her maç için sinyal üretim süreci
+            new_signals = []
+            
+            for match in live_matches:
+                match_signals = await self._process_match(match)
+                new_signals.extend(match_signals)
+            
+            # 3. Sinyalleri güncelle
+            self._update_signals(new_signals)
+            
+            # 4. Durum güncelle
+            self.last_update = datetime.now()
+            self.active_matches = {m['id']: m for m in live_matches}
+            
+            self.logger.info(f"🔄 Engine döngüsü tamamlandı - {len(new_signals)} yeni sinyal")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ana döngü hatası: {e}")
+    
+    async def _get_live_matches(self) -> List[Dict]:
+        """
+        Canlı maçları SportMonks'tan al
+        """
+        try:
+            # SportMonks Advanced - canlı maçlar
+            live_matches = await self.sm_client.get_live_matches()
+            
+            # Sadece desteklenen liglerdeki maçları filtrele
+            filtered_matches = [
+                match for match in live_matches 
+                if match.get('league_id') in self.config.supported_leagues
+            ]
+            
+            self.logger.debug(f"📊 {len(filtered_matches)} canlı maç bulundu")
+            return filtered_matches
+            
+        except Exception as e:
+            self.logger.error(f"❌ Canlı maç verisi alınamadı: {e}")
+            return []
+    
+    async def _process_match(self, match: Dict) -> List[Dict]:
+        """
+        Tek maç için sinyal üretim süreci
+        
+        Args:
+            match: Maç verisi
+            
+        Returns:
+            Bu maç için üretilen sinyaller
+        """
+        match_id = match['id']
+        
+        try:
+            # 1. Detaylı maç verisi al (SportMonks Advanced)
+            match_data = await self.sm_client.get_match_details(match_id)
+            
+            # 2. Pre-match trend verileri al (FootyStats)
+            trend_data = await self.fs_client.get_match_trends(match_id)
+            
+            # 3. Veri birleştirme
+            combined_data = {
+                'match': match_data,
+                'trends': trend_data,
+                'timestamp': datetime.now()
+            }
+            
+            # 4. Market seçimi - hangi marketlerde sinyal aranacak
+            candidate_markets = await self.market_selector.select_markets(combined_data)
+            
+            if not candidate_markets:
+                return []
+            
+            # 5. RL Agent - final sinyal kararı
+            final_signals = await self.rl_agent.generate_signals(
+                combined_data, 
+                candidate_markets
+            )
+            
+            self.logger.debug(f"🎯 Maç {match_id}: {len(final_signals)} sinyal üretildi")
+            return final_signals
+            
+        except Exception as e:
+            self.logger.error(f"❌ Maç {match_id} işlenemedi: {e}")
+            return []
+    
+    def _update_signals(self, new_signals: List[Dict]):
+        """
+        Sinyal listesini güncelle
+        
+        Args:
+            new_signals: Yeni üretilen sinyaller
+        """
+        # Eski sinyalleri temizle (expired olanlar)
+        current_time = datetime.now()
+        
+        self.generated_signals = [
+            signal for signal in self.generated_signals
+            if current_time - signal['created_at'] < timedelta(minutes=self.config.signal_ttl)
+        ]
+        
+        # Yeni sinyalleri ekle
+        for signal in new_signals:
+            signal['created_at'] = current_time
+            signal['status'] = 'active'
+        
+        self.generated_signals.extend(new_signals)
+        
+        self.logger.info(f"📊 Toplam aktif sinyal: {len(self.generated_signals)}")
+    
+    def get_active_signals(self) -> List[Dict]:
+        """
+        Aktif sinyalleri döndür - API ve Dashboard için
+        
+        Returns:
+            Aktif sinyal listesi
+        """
+        return [
+            signal for signal in self.generated_signals
+            if signal['status'] == 'active'
+        ]
+    
+    def get_engine_status(self) -> Dict:
+        """
+        Engine durumu - monitoring için
+        
+        Returns:
+            Engine durum bilgileri
+        """
+        return {
+            'is_running': self.is_running,
+            'last_update': self.last_update.isoformat() if self.last_update else None,
+            'active_matches_count': len(self.active_matches),
+            'active_signals_count': len(self.get_active_signals()),
+            'total_signals_generated': len(self.generated_signals),
+            'uptime': (datetime.now() - self.last_update).total_seconds() if self.last_update else 0
+        }
+    
+    async def manual_signal_generation(self, match_id: int) -> List[Dict]:
+        """
+        Manuel sinyal üretimi - test ve debug için
+        
+        Args:
+            match_id: Maç ID'si
+            
+        Returns:
+            Üretilen sinyaller
+        """
+        try:
+            # Maç verisini al
+            match_data = await self.sm_client.get_match_details(match_id)
+            
+            if not match_data:
+                return []
+            
+            # Sinyal üretim sürecini çalıştır
+            signals = await self._process_match({'id': match_id})
+            
+            self.logger.info(f"🔧 Manuel sinyal üretimi - Maç {match_id}: {len(signals)} sinyal")
+            return signals
+            
+        except Exception as e:
+            self.logger.error(f"❌ Manuel sinyal üretimi hatası: {e}")
+            return []
+
+
+# Async context manager için
+class ScoutEngineManager:
+    """
+    Scout Engine'i yönetmek için context manager
+    """
+    
+    def __init__(self, config_path: str = "config.json"):
+        self.engine = ScoutCoreEngine(config_path)
+    
+    async def __aenter__(self):
+        return self.engine
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.engine.stop_engine()
+
+
+# CLI için basit başlatma
+async def main():
+    """
+    CLI'dan engine başlatma
+    """
+    async with ScoutEngineManager() as engine:
+        print("🚀 Scout Core Engine v6.0 başlatılıyor...")
+        await engine.start_engine()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

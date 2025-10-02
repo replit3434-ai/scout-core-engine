@@ -1,0 +1,191 @@
+Sorun SportMonks tarafında (livescores time=null, status=""). Bizde aksiyon: otomatik “inplay fallback” + event/periods tabanlı minute hesaplama + m=0 maçları dışlama + uyarı/loglama.
+
+Aşağıdaki minimal yama üretimde güvenli ve geri alınabilir.
+
+Env bayrağı
+USE_INPLAY_FALLBACK=1 ile aç/kapa
+sm_client.py — inplay fallback + sağlam minute parser
+Aşağıyı uygun yerlere ekle/uyarla.
+python
+Copy
+import os, json, time
+from typing import Dict, Any, Optional
+
+USE_INPLAY_FALLBACK = os.getenv("USE_INPLAY_FALLBACK", "1") in ("1","true","True")
+
+def _extract_minute(raw: Dict[str, Any]) -> int:
+    t = (raw.get("time") or {}) if isinstance(raw.get("time"), dict) else {}
+    # 1) Yaygın path'ler
+    for k in ("minute", "minutes"):
+        v = t.get(k)
+        if isinstance(v, int):
+            return v
+    # 2) Varyantlar
+    v = ((t.get("current") or {}) if isinstance(t.get("current"), dict) else {}).get("minute")
+    if isinstance(v, int): return v
+    v = ((raw.get("live") or {}) if isinstance(raw.get("live"), dict) else {}).get("minute")
+    if isinstance(v, int): return v
+    # 3) Periods
+    periods = (raw.get("periods") or {})
+    if isinstance(periods, dict):
+        data = periods.get("data")
+        if isinstance(data, list) and data:
+            v = data[0].get("minute")
+            if isinstance(v, int): return v
+        first = periods.get("first")
+        if isinstance(first, dict):
+            v = first.get("minute")
+            if isinstance(v, int): return v
+    # 4) starting_at’tan hesap (status canlıysa)
+    status = str((raw.get("status") or {}).get("name") or t.get("status") or "").upper()
+    live_statuses = {"LIVE","INPLAY","1ST_HALF","2ND_HALF","ET","AET","PEN"}
+    start_ts = None
+    starting_at = t.get("starting_at")
+    if isinstance(starting_at, dict):
+        ts = starting_at.get("timestamp")
+        if isinstance(ts, (int, float)): start_ts = int(ts)
+        else:
+            iso = starting_at.get("date_time") or starting_at.get("date")
+            if iso:
+                try: start_ts = int(time.mktime(time.strptime(iso.split("+")[0], "%Y-%m-%d %H:%M:%S")))
+                except Exception: pass
+    if start_ts and status in live_statuses:
+        now = int(time.time())
+        elapsed = max(0, (now - start_ts) // 60)
+        return min(130, elapsed)
+    # 5) Yoksa 0
+    return 0
+
+def _extract_teams_py(raw: Dict[str, Any]) -> (str, str):
+    parts = raw.get("participants")
+    if isinstance(parts, dict): parts = parts.get("data")
+    teams = raw.get("teams")
+    if isinstance(teams, dict): teams = teams.get("data")
+    arr = parts if isinstance(parts, list) else (teams if isinstance(teams, list) else None)
+    if isinstance(arr, list) and len(arr) >= 2:
+        def loc(p): return (p.get("meta", {}) or {}).get("location") or p.get("location") or p.get("side")
+        homeP = next((p for p in arr if loc(p) == "home"), arr[0])
+        awayP = next((p for p in arr if loc(p) == "away"), arr[1] if len(arr)>1 else arr[0])
+        home = homeP.get("name") or homeP.get("short_code") or ((raw.get("localteam") or {}).get("data") or {}).get("name")
+        away = awayP.get("name") or awayP.get("short_code") or ((raw.get("visitorteam") or {}).get("data") or {}).get("name")
+        return home or "Unknown", away or "Unknown"
+    lt = ((raw.get("localteam") or {}).get("data") or {}).get("name")
+    vt = ((raw.get("visitorteam") or {}).get("data") or {}).get("name")
+    return lt or "Unknown", vt or "Unknown"
+
+def _normalize_match_sm(raw: Dict[str, Any]) -> Dict[str, Any]:
+    mid = raw.get("id") or raw.get("fixture_id") or raw.get("uuid")
+    league_id = ((raw.get("league") or {}).get("id")) or raw.get("league_id")
+    minute = _extract_minute(raw)
+    home, away = _extract_teams_py(raw)
+    scores = raw.get("scores") or {}
+    home_g = scores.get("localteam_score") if isinstance(scores, dict) else None
+    away_g = scores.get("visitorteam_score") if isinstance(scores, dict) else None
+    if home_g is None: home_g = scores.get("home")
+    if away_g is None: away_g = scores.get("away")
+    status = ((raw.get("status") or {}) or {}).get("name") or (raw.get("time") or {}).get("status") or ""
+    return {
+        "match_id": mid,
+        "league_id": int(league_id) if league_id else None,
+        "home_team": home,
+        "away_team": away,
+        "minute": int(minute) if isinstance(minute, int) else 0,
+        "home_goals": home_g,
+        "away_goals": away_g,
+        "status": status,
+        "raw_time": raw.get("time", None),
+    }
+
+async def _fetch_inplay() -> Dict[str, Any]:
+    url = f"{SM_BASE_URL}/fixtures/inplay"
+    params = {
+        "api_token": SM_TOKEN,
+        "include": "events;periods;statistics;participants"
+    }
+    return await safe_request(url, params=params)
+
+def _minute_from_inplay(raw: Dict[str, Any]) -> Optional[int]:
+    # Primarily from periods
+    periods = raw.get("periods") or {}
+    data = periods.get("data") if isinstance(periods, dict) else None
+    if isinstance(data, list) and data:
+        v = data[0].get("minute")
+        if isinstance(v, int) and v > 0:
+            return v
+    # Fallback from recent events (e.g., 'ht', '2h', 'goal' timestamps ⇒ derive minute if present)
+    evs = raw.get("events")
+    if isinstance(evs, dict): evs = evs.get("data")
+    if isinstance(evs, list) and evs:
+        for e in evs[:5]:
+            v = e.get("minute")
+            if isinstance(v, int) and v > 0:
+                return v
+    return None
+Livescores çekiminden sonra “inplay fallback” ile birleştir:
+
+python
+Copy
+async def get_live_matches() -> list[dict]:
+    # 1) livescores (sade include)
+    params = {
+        "api_token": SM_TOKEN,
+        "include": "participants;statistics;scores;league",
+    }
+    url = f"{SM_BASE_URL}/livescores"
+    ls = await safe_request(url, params=params)
+    items = (ls.get("data") if isinstance(ls, dict) else ls) or []
+
+    # 2) inplay fallback (isteğe bağlı)
+    inplay_map: Dict[str, Any] = {}
+    if USE_INPLAY_FALLBACK:
+        try:
+            ip = await _fetch_inplay()
+            ip_items = (ip.get("data") if isinstance(ip, dict) else ip) or []
+            for r in ip_items:
+                rid = r.get("id") or r.get("fixture_id") or r.get("uuid")
+                if rid: inplay_map[str(rid)] = r
+        except Exception as e:
+            logger.warning("Inplay fallback fetch failed: %s", e)
+
+    normalized = []
+    missing_minute_cnt = 0
+    for raw in items:
+        nm = _normalize_match_sm(raw)
+        # Eğer minute=0 ve inplay'de varsa -> dakika kurtar
+        if nm["minute"] == 0 and USE_INPLAY_FALLBACK:
+            rid = str(nm["match_id"])
+            ip_raw = inplay_map.get(rid)
+            if ip_raw:
+                fix_min = _minute_from_inplay(ip_raw)
+                if isinstance(fix_min, int) and fix_min > 0:
+                    nm["minute"] = fix_min
+                    nm["status"] = ((ip_raw.get("status") or {}) or {}).get("name") or nm["status"]
+                    nm["raw_time"] = ip_raw.get("time") or nm["raw_time"]
+        if nm["minute"] == 0:
+            missing_minute_cnt += 1
+            # Sert dışla
+            continue
+        normalized.append(nm)
+
+    total = len(items)
+    if total > 0 and missing_minute_cnt / total >= 0.3:
+        logger.warning("LIVESCORES weak feed: %d/%d matches had minute=0/time=null; inplay fallback=%s",
+                       missing_minute_cnt, total, "ON" if USE_INPLAY_FALLBACK else "OFF")
+    logger.info("Normalized %d matches after fallback (from %d)", len(normalized), total)
+    return normalized
+Hızlı testler
+Bozuk livescores’ı doğrula:
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/livescores?api_token=$SPORTMONKS_API_KEY&include=participants;statistics;scores;league" | jq '.data[] | {id, status: .status.name, time: .time}'
+Inplay fallback:
+bash
+Copy
+curl "https://api.sportmonks.com/v3/football/fixtures/inplay?api_token=$SPORTMONKS_API_KEY&include=events;periods;statistics;participants" | jq '.data[] | {id, minute: .periods.data[0].minute, events_len: (.events.data|length)}'
+Operasyonel öneriler
+Alerting: 5 dakika boyunca livescores minute=0 oranı ≥ %50 ise uyarı log + Slack/Telegram notify.
+Ticket: “/livescores time=null, status='' for live Serie A fixtures; /fixtures/inplay has minute via periods. Please fix livescores mapping.”
+Beklenen sonuç
+livescores boş geldiğinde pipeline takılmaz; inplay’den dakika kurtarır.
+minute=0 maçlar kesin dışlandığı için sahte sinyal üretimi biter.
+Loglarda “LIVESCORES weak feed” uyarısını görürsün; sorun SportMonks’a aittir, ama sistemimiz kesintisiz çalışır.

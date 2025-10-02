@@ -1,0 +1,250 @@
+Hemen “Dashboard kırılıyor” senaryosu için tek-seferde uygulanabilir backend+frontend yamalarını veriyorum. Amaç: yeni şema ile UI’nın uyumu, null-safe render ve sınırlamanın maç başına/bazlı çalışması.
+
+Backend (Active Signals API) — sade, UI-dostu şema
+API snapshot’ı UI’nın bekleyeceği alanlarla sabitle (id, match_id, market, home, away, confidence, minute, ttl_left, state).
+api/server.py (snapshot dönen yapı zaten böyleyse geç; değilse şu formatı verdir):
+python
+Copy
+# api/server.py (snapshot değişikliği örneği)
+def _ui_signal(s):
+    return {
+        "id": s.id,
+        "match_id": s.match_id,
+        "market": s.market,
+        "home": s.home,
+        "away": s.away,
+        "confidence": float(s.confidence) if s.confidence is not None else None,
+        "minute": int(s.minute) if s.minute is not None else None,
+        "ttl_left": int(s.time_left()),
+        "state": s.state,
+    }
+
+def snapshot(self) -> Dict:
+    active = [s for s in self.signals.values() if s.state == "ACTIVE"]
+    active.sort(key=self._priority)
+    return {
+        "active": [_ui_signal(s) for s in active],
+        "counts": {
+            "PRE": sum(1 for s in self.signals.values() if s.state == "PRE"),
+            "CANDIDATE": sum(1 for s in self.signals.values() if s.state == "CANDIDATE"),
+            "ACTIVE": len(active),
+        }
+    }
+max_signals_total KALKSIN; maç başına limit ve market bazlı eşikler config.json’dan gelsin.
+services/active_signal_service.py (çekirdek değişiklikler):
+python
+Copy
+import json, os, time
+from collections import defaultdict
+
+# Config loader
+def load_config():
+    try:
+        with open("config.json", "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    # Defaults
+    cfg.setdefault("signal_ttl", 15)  # minutes
+    cfg.setdefault("over_under", {"enabled": True, "min_confidence": 0.65, "max_signals_per_match": 2})
+    cfg.setdefault("btts", {"enabled": True, "min_confidence": 0.60, "max_signals_per_match": 2})
+    cfg.setdefault("next_goal", {"enabled": True, "min_confidence": 0.70, "max_signals_per_match": 1})
+    return cfg
+
+CFG = load_config()
+
+def market_conf_threshold(market: str) -> float:
+    if market.startswith("over_") or market.startswith("under_"):
+        return float(CFG["over_under"]["min_confidence"])
+    if market.startswith("btts"):
+        return float(CFG["btts"]["min_confidence"])
+    if market.startswith("next_goal"):
+        return float(CFG["next_goal"]["min_confidence"])
+    return 0.65  # default
+
+def per_match_limit(market: str) -> int:
+    if market.startswith("over_") or market.startswith("under_"):
+        return int(CFG["over_under"]["max_signals_per_match"])
+    if market.startswith("btts"):
+        return int(CFG["btts"]["max_signals_per_match"])
+    if market.startswith("next_goal"):
+        return int(CFG["next_goal"]["max_signals_per_match"])
+    return 2
+
+CONF_ACTIVE_DEFAULT = 0.65
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "300"))
+MATURATION_WINDOW = int(os.getenv("MATURATION_WINDOW", "60"))
+
+class ActiveSignalService:
+    # ... mevcut init() aynı (signals dict, cooldown dict) ...
+
+    def _promote(self, s):
+        thr = market_conf_threshold(s.market)
+        if s.state == "PRE" and s.confidence is not None and s.confidence >= (thr - 0.15) and s.liquidity_ok:
+            s.state = "CANDIDATE"
+        if s.state == "CANDIDATE" and s.confidence is not None and s.confidence >= thr and s.age() >= MATURATION_WINDOW and s.liquidity_ok:
+            if self._dedupe(s):
+                s.state = "ACTIVE"
+                self.cooldown[s.id] = time.time()
+
+    def update(self, candidates):
+        # ... merge + promote + expire (aynı) ...
+        actives = [s for s in self.signals.values() if s.state == "ACTIVE"]
+
+        # MAÇ BAŞINA LİMİT
+        grouped = defaultdict(list)
+        for s in actives:
+            grouped[s.match_id].append(s)
+        limited = []
+        for match_id, lst in grouped.items():
+            lst.sort(key=lambda x: (-x.confidence, x.time_left()))
+            # her market tipine ayrı sınır uygula
+            per_market = defaultdict(list)
+            for s in lst:
+                key = ("ou" if s.market.startswith(("over_", "under_")) else
+                       "btts" if s.market.startswith("btts") else
+                       "next_goal" if s.market.startswith("next_goal") else "other")
+                per_market[key].append(s)
+            for key, items in per_market.items():
+                cap = (per_match_limit("over_2_5") if key == "ou" else
+                       per_match_limit("btts") if key == "btts" else
+                       per_match_limit("next_goal") if key == "next_goal" else 2)
+                limited.extend(items[:cap])
+
+        return limited
+config.json örneğin DoĞRu — max_signals_total artık yok, per-match limit var. Sadece dosyayı köke koyup Core Engine’i restart et.
+Restart:
+bash
+Copy
+# Contabo
+sudo systemctl restart scout_core && sudo journalctl -fu scout_core
+# Replit
+Run butonuna tıkla
+Frontend (React/TypeScript) — null-safe ve yeni şemaya uyum
+types.ts — API şemasını sabitle, opsiyonel alanları işaretle
+ts
+Copy
+// types.ts
+export type SignalState = "PRE" | "CANDIDATE" | "ACTIVE" | "EXPIRED";
+
+export interface ActiveSignal {
+  id: string;
+  match_id: string;
+  market: string;
+  home: string | null;
+  away: string | null;
+  confidence: number | null;
+  minute: number | null;
+  ttl_left: number; // seconds
+  state: SignalState;
+}
+
+export interface ActiveSnapshot {
+  active: ActiveSignal[];
+  counts: { PRE: number; CANDIDATE: number; ACTIVE: number };
+}
+api.ts — adaptör: backend’in verdiğini UI’ya null-safe normalize et
+ts
+Copy
+// api.ts
+import { ActiveSignal, ActiveSnapshot } from "./types";
+
+const API_BASE = import.meta.env.VITE_API_BASE || "";
+
+function normalizeSignal(s: any): ActiveSignal {
+  return {
+    id: String(s?.id ?? ""),
+    match_id: String(s?.match_id ?? ""),
+    market: String(s?.market ?? "unknown"),
+    home: s?.home ?? null,
+    away: s?.away ?? null,
+    confidence: typeof s?.confidence === "number" ? s.confidence : null,
+    minute: Number.isFinite(s?.minute) ? s.minute : null,
+    ttl_left: Number.isFinite(s?.ttl_left) ? s.ttl_left : 0,
+    state: (s?.state as any) ?? "ACTIVE",
+  };
+}
+
+export async function fetchActiveSignals(): Promise<ActiveSnapshot> {
+  const res = await fetch(`${API_BASE}/active-signals`);
+  const raw = await res.json();
+  const active = Array.isArray(raw?.active) ? raw.active.map(normalizeSignal) : [];
+  return {
+    active,
+    counts: {
+      PRE: Number(raw?.counts?.PRE ?? 0),
+      CANDIDATE: Number(raw?.counts?.CANDIDATE ?? 0),
+      ACTIVE: active.length,
+    },
+  };
+}
+SignalCard.tsx — null-check’ler ve güvenli render
+tsx
+Copy
+// SignalCard.tsx
+import React from "react";
+import { ActiveSignal } from "../types";
+
+export function SignalCard({ s }: { s: ActiveSignal }) {
+  const home = s.home ?? "Home";
+  const away = s.away ?? "Away";
+  const conf = s.confidence != null ? Math.round(s.confidence * 100) : "—";
+  const minute = s.minute != null ? `${s.minute}'` : "—";
+  const ttlMin = Math.max(0, Math.floor((s.ttl_left ?? 0) / 60));
+
+  return (
+    <div className="signal-card">
+      <div className="teams">{home} vs {away}</div>
+      <div className="market">{s.market}</div>
+      <div className="meta">
+        <span>Confidence: {conf}%</span>
+        <span>Minute: {minute}</span>
+        <span>TTL: {ttlMin}m</span>
+      </div>
+    </div>
+  );
+}
+ActiveSignalsList.tsx — UI sınırı (max 10) sadece listede uygulanır
+tsx
+Copy
+// ActiveSignalsList.tsx
+import React from "react";
+import { SignalCard } from "./SignalCard";
+import { ActiveSignal } from "../types";
+
+export function ActiveSignalsList({ items, max = 10 }: { items: ActiveSignal[]; max?: number }) {
+  const list = (items || []).slice(0, max);
+  if (list.length === 0) return <div>No active signals</div>;
+  return (
+    <div className="signals">
+      {list.map((s) => <SignalCard key={s.id} s={s} />)}
+    </div>
+  );
+}
+Hızlı log/diagnostics
+Frontend:
+bash
+Copy
+# CRA/Vite:
+npm run dev
+# Log izle:
+tail -f logs/frontend.log || (browser console + terminal)
+Özellikle “TypeError: cannot read property … of undefined” görürsen, ilgili component’te optional chaining (?.) ve default değer ekle.
+Test planı (5 dk)
+Backend’i restart et. Log:
+“SportMonks API returned N matches from leagues: [...]”
+“Active signals selected: K”
+Frontend:
+/active-signals GET’i aç; beklenen şema geliyor mu kontrol et
+UI’da kartlar null-safe görünüyor mu?
+Düşük confidence simülasyonu:
+CONF env/konfig düşürmeden, UI’da “No active signals” görünebilir — bu normal. Test için candidate üretimini artır veya min_confidence’i (config.json) azalt:
+json
+Copy
+"over_under": { "enabled": true, "min_confidence": 0.50, "max_signals_per_match": 2 }
+Restart et.
+
+Sonuç
+max_signals_total kaldırıldı → limitsiz üretim, ama per-match ve market bazlı limitler korundu
+API şeması sade ve stabil; UI null-safe
+Dashboard “schema mismatch” tipindeki hatalara karşı dayanıklı; TypeError’lar engellendi

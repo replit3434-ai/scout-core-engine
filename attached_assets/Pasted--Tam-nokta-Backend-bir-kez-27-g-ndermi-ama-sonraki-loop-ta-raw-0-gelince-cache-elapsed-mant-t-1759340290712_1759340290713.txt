@@ -1,0 +1,222 @@
+⚡️ Tam nokta: Backend bir kez 27 göndermiş ama sonraki loop'ta raw=0 gelince cache+elapsed mantığı tekrar çalışmamış veya override edilmiş. Aşağıya "Minute Override Guard" + "Auto-Increment" + "Stale Fallback" patch'ini hem Python (backend) hem TypeScript (core-engine/adapter) için bırakıyorum.
+
+Patch: Minute Override Guard + Auto-Increment
+1) Python Backend — normalize içinde guard + elapsed her loop'ta
+python
+Copy
+# sm_client.py veya normalize fonksiyonunda
+from minute_utils import parse_minute, apply_minute_cache, is_stale, maybe_hydrate_from_inplay
+import time
+
+# Global: fixture_id -> (last_normalized_minute, last_update_ts)
+_last_normalized: Dict[str, Tuple[int, float]] = {}
+
+async def _normalize_match_sm(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    fid = str(raw.get("id") or raw.get("fixture_id") or raw.get("match_id"))
+    now = time.time()
+    
+    # 1) Çok katmanlı parse (raw)
+    raw_minute = parse_minute(raw)
+    
+    # 2) Cache + elapsed
+    cached_minute, used_cache = apply_minute_cache(fid, raw_minute)
+    
+    # 3) Override Guard: eğer raw=0 ama önceki normalized >0 ise elapsed ekle
+    prev = _last_normalized.get(fid)
+    if raw_minute == 0 and prev:
+        last_norm, last_ts = prev
+        elapsed_since = max(0, int((now - last_ts) // 60))
+        inflated = min(130, last_norm + elapsed_since)
+        # cached_minute ile karşılaştır; hangisi büyükse onu al
+        normalized_minute = max(cached_minute, inflated)
+    else:
+        normalized_minute = cached_minute if cached_minute > 0 else raw_minute
+    
+    # 4) Stale/inplay fallback
+    if normalized_minute == 0 or is_stale(fid):
+        normalized_minute = await maybe_hydrate_from_inplay(fid, normalized_minute, fetch_inplay_fixture)
+    
+    # 5) Hâlâ 0 ise drop
+    if normalized_minute == 0:
+        logger.debug("Dropping fixture %s: minute=0 after all fallbacks", fid)
+        return None
+    
+    # 6) Son normalized'ı kaydet (bir sonraki loop için)
+    _last_normalized[fid] = (normalized_minute, now)
+    
+    logger.debug(
+        "MINUTE GUARD: fixture=%s | raw=%d | cached=%d | normalized=%d | elapsed_guard=%s",
+        fid, raw_minute, cached_minute, normalized_minute, (raw_minute == 0 and prev is not None)
+    )
+    
+    return {
+        "match_id": fid,
+        "minute": normalized_minute,
+        "raw_minute": raw_minute,
+        "home_team": ...,
+        "away_team": ...,
+        "meta": {
+            "used_cache": used_cache,
+            "stale": is_stale(fid),
+            "guard_applied": (raw_minute == 0 and prev is not None),
+        }
+    }
+2) TypeScript Adapter — aynı guard mantığı
+ts
+Copy
+// sportmonks-adapter.ts
+import { parseMinute, applyMinuteCache, isStaleMinute, maybeHydrateFromInplay } from "./minute_utils";
+
+type NormEntry = { minute: number; ts: number };
+const lastNormalized = new Map<string, NormEntry>();
+
+export async function normalizeFixture(raw: any): Promise<NormalizedMatch | null> {
+  const id = String(raw?.id ?? raw?.fixture_id);
+  const now = Date.now();
+  
+  // 1) Raw parse
+  const rawMinute = parseMinute(raw);
+  
+  // 2) Cache + elapsed
+  const cacheRes = applyMinuteCache(id, rawMinute);
+  let cachedMinute = cacheRes.minute;
+  
+  // 3) Override Guard
+  const prev = lastNormalized.get(id);
+  let normalizedMinute = cachedMinute;
+  let guardApplied = false;
+  
+  if (rawMinute === 0 && prev) {
+    const elapsedMin = Math.max(0, Math.floor((now - prev.ts) / 60000));
+    const inflated = Math.min(130, prev.minute + elapsedMin);
+    normalizedMinute = Math.max(cachedMinute, inflated);
+    guardApplied = true;
+  } else if (cachedMinute > 0) {
+    normalizedMinute = cachedMinute;
+  } else {
+    normalizedMinute = rawMinute;
+  }
+  
+  // 4) Stale/inplay fallback
+  if (normalizedMinute === 0 || isStaleMinute(id)) {
+    normalizedMinute = await maybeHydrateFromInplay(id, normalizedMinute, fetchInplayFixture);
+  }
+  
+  // 5) Hâlâ 0 ise drop
+  if (normalizedMinute === 0) {
+    console.debug(`Dropping fixture ${id}: minute=0 after all fallbacks`);
+    return null;
+  }
+  
+  // 6) Son normalized'ı kaydet
+  lastNormalized.set(id, { minute: normalizedMinute, ts: now });
+  
+  console.debug(
+    `MINUTE GUARD: fixture=${id} | raw=${rawMinute} | cached=${cachedMinute} | normalized=${normalizedMinute} | guard=${guardApplied}`
+  );
+  
+  return {
+    matchId: id,
+    minute: normalizedMinute,
+    rawMinute,
+    home: extractHome(raw),
+    away: extractAway(raw),
+    meta: {
+      usedCache: cacheRes.usedCache,
+      stale: isStaleMinute(id),
+      guardApplied,
+    },
+  };
+}
+3) Frontend UI Auto-Increment (opsiyonel ama güçlü)
+Eğer backend'den yeni minute gelmezse UI kendi sayacıyla dakika ilerletir (TTL ile senkron).
+
+tsx
+Copy
+// SignalCard.tsx
+import { useEffect, useState } from "react";
+
+export function SignalCard({ signal }: { signal: ActiveSignal }) {
+  const [displayMinute, setDisplayMinute] = useState(signal.minute);
+  const [lastUpdate, setLastUpdate] = useState(Date.now());
+
+  // Backend'den yeni minute geldiğinde sıfırla
+  useEffect(() => {
+    setDisplayMinute(signal.minute);
+    setLastUpdate(Date.now());
+  }, [signal.minute]);
+
+  // Her 60 saniyede bir otomatik +1 (eğer backend güncellemezse)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const elapsedMin = Math.floor((Date.now() - lastUpdate) / 60000);
+      if (elapsedMin > 0) {
+        setDisplayMinute((prev) => Math.min(130, prev + elapsedMin));
+        setLastUpdate(Date.now());
+      }
+    }, 60000); // 60 sn
+    return () => clearInterval(interval);
+  }, [lastUpdate]);
+
+  return (
+    <div className="signal-card">
+      <div className="minute-badge">
+        {displayMinute}' {/* ← otomatik ilerleyen dakika */}
+      </div>
+      
+      {/* Debug (dev ortamında) */}
+      {process.env.NODE_ENV === "development" && (
+        <small className="text-muted">
+          backend: {signal.minute}' | raw: {signal.rawMinute}' | guard: {signal.meta?.guardApplied ? "✓" : "✗"}
+        </small>
+      )}
+      
+      {signal.meta?.stale && <span className="badge badge-warning">⚠ stale</span>}
+      
+      {/* ... diğer alanlar ... */}
+    </div>
+  );
+}
+4) Stale Minute Check (120 sn değişmezse starting_at'tan hesapla)
+Zaten is_stale() ve maybeHydrateFromInplay() ile kapsanıyor; ama ek güvence için:
+
+python
+Copy
+# minute_utils.py içinde
+def ensure_minute_progress(fixture_id: str, normalized_minute: int, raw: Dict[str, Any]) -> int:
+    if is_stale(fixture_id) and normalized_minute > 0:
+        # 120 sn boyunca değişmedi; kickoff'tan hesapla
+        ko = _from_kickoff(raw)
+        if ko > normalized_minute:
+            logger.warning("Stale minute detected for %s; using kickoff: %d -> %d", fixture_id, normalized_minute, ko)
+            return ko
+    return normalized_minute
+Normalize sonunda çağır:
+
+python
+Copy
+normalized_minute = ensure_minute_progress(fid, normalized_minute, raw)
+5) Log beklentisi
+MINUTE GUARD: fixture=12345 | raw=0 | cached=27 | normalized=28 | elapsed_guard=True
+raw=0: SportMonks yine boş gönderdi
+cached=27: önceki loop'tan cache
+normalized=28: elapsed +1 eklendi
+guard=True: override guard devreye girdi
+6) Hızlı test
+Backend restart sonrası birkaç loop izle:
+bash
+Copy
+tail -f logs/scout_core.log | grep "MINUTE GUARD"
+UI'de kartlarda dakika her 60 sn'de +1 artmalı (backend güncellemese bile).
+raw=0 geldiğinde normalized geriye düşmemeli.
+Özet
+Katman	Değişiklik	Etki
+Backend normalize	Override guard: raw=0 ise prev+elapsed kullan	Dakika geriye düşmez
+TypeScript adapter	Aynı guard mantığı	Node/TS tarafında da korunur
+Frontend UI	Auto-increment: 60 sn'de +1	Backend donsa bile UI ilerler
+Stale check	120 sn değişmezse kickoff'tan hesapla	Uzun freeze'lerde kurtarma
+Bu patch'le:
+
+27'den sonra raw=0 gelse bile 28, 29, 30... diye ilerler.
+UI kendi sayacıyla da destekler; donma görsel olarak da ortadan kalkar.
+Log'da "guard=True" ile override korumasını izlersin.
